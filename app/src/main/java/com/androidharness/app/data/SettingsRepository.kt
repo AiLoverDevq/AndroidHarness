@@ -15,7 +15,7 @@ import kotlinx.coroutines.flow.map
 
 val Context.settingsStore by preferencesDataStore(name = "settings")
 
-private val WEB_SEARCH_PROVIDERS = setOf("keyless", "brave", "tavily")
+private val WEB_SEARCH_PROVIDERS = com.androidharness.app.tools.SearchProviders.ids.toSet()
 
 enum class ThemeMode { SYSTEM, LIGHT, DARK, AMOLED }
 
@@ -34,11 +34,16 @@ data class AppSettings(
     val dynamicColor: Boolean = true,
     val colorPalette: ThemePalette = ThemePalette.BLUE,
     val customPalettes: List<CustomThemePalette> = emptyList(),
+    /** Settings sections the user built for themselves, shown on the settings home. */
+    val customSections: List<CustomSettingsSection> = emptyList(),
     val activeCustomPaletteId: String? = null,
     val harnessCanvas: HarnessCanvasSettings = HarnessCanvasSettings(),
     val harnessGlassEnabled: Boolean = false,
     val harnessLiquidGlass: Boolean = false,
     val harnessGlassTransparency: Float = 0.5f,
+    /** Motion blur that follows fast vertical scrolling. Only drawn on Android 12+. */
+    val motionBlurEnabled: Boolean = false,
+    val motionBlurIntensity: Float = 0.5f,
     val progressBarStyle: ProgressBarStyle = ProgressBarStyle.FLAT,
     val workspaceLayout: WorkspaceLayoutMode = WorkspaceLayoutMode.AUTO,
     val editorWordWrap: Boolean = false,
@@ -82,8 +87,13 @@ data class AppSettings(
     val sameModelAcrossChats: Boolean = true,
     /** Skill names hidden from the catalog and slash picker. */
     val disabledSkills: Set<String> = emptySet(),
-    /** web_search backend: "keyless" (default) | "brave" | "tavily". */
+    /**
+     * The search provider picked before several could be on at once. Kept for backups and
+     * older builds; web_search now uses every provider that is not in [disabledSearchProviders].
+     */
     val webSearchProvider: String = "keyless",
+    /** Search providers the user switched off. Everything else that is ready (has keys, or needs none) can be used. */
+    val disabledSearchProviders: Set<String> = emptySet(),
     /**
      * Screenshots are allowed by default outside credential screens. Off blocks
      * them app wide; screens that show keys and tokens always block.
@@ -141,6 +151,8 @@ data class AppSettings(
     /** Chat opens a fresh conversation unless the user asks to continue the latest one. */
     val chatStart: ChatStartMode = ChatStartMode.NEW_CHAT,
     val chatKeepThinkingCollapsed: Boolean = true,
+    /** Lets Chat set reminders that show as notifications. */
+    val chatRemindersEnabled: Boolean = true,
     val chatSearchCodeChats: Boolean = true,
     val codeSearchChatChats: Boolean = true,
     /** AH Rumble: a haptic pulse whenever a Chat turn moves to a new step. */
@@ -197,6 +209,21 @@ data class AppSettings(
     val showTodoList: Boolean = true,
     /** Off removes the task tool and every subagent control, so nothing can start a subagent. */
     val subagentsEnabled: Boolean = true,
+    /** Lets the agent show a card with buttons to Android's storage access pages. Never grants anything itself. */
+    val storageAccessCards: Boolean = true,
+    /** Seconds a stream may stay silent before the run pauses with a stall error. */
+    val streamStallTimeoutSeconds: Int = com.androidharness.app.agent.StreamRetrier.DEFAULT_STALL_TIMEOUT_SECONDS,
+    /**
+     * For models whose server holds a tool call back until it is finished, ask
+     * for file contents as streamed reply text so the write shows live.
+     */
+    val streamFileWritesAsText: Boolean = true,
+    /** "providerId|model" keys seen delivering a whole write in one chunk. */
+    val bufferedToolCallModels: Set<String> = emptySet(),
+    /** Models that called write_file with the file block marker but never wrote the block. */
+    val fileBlockDeclinedModels: Set<String> = emptySet(),
+    /** "providerId|model" to the input window its server named when it rejected a request as too long. */
+    val learnedContextLimits: Map<String, Int> = emptyMap(),
     /** ID of the last active chat session. */
     val lastActiveSessionId: String? = null,
     /** Generate and inject compact codebase symbol index (Repo map) into agent context. */
@@ -205,6 +232,12 @@ data class AppSettings(
     val localModelAgentContext: Boolean = false,
     /** Explicit, device-local consent for experimental local model features. */
     val localModelExperimental: Boolean = false,
+    /** Provider debug console. Capture is memory-only unless keep-on-device is on. */
+    val debugConsoleEnabled: Boolean = false,
+    val debugConsoleBodies: Boolean = false,
+    val debugConsolePersist: Boolean = false,
+    /** Set once the user agreed that bodies may hold prompts and replies. */
+    val debugConsoleConsent: Boolean = false,
     val cavemanInstalled: Boolean = false,
     val cavemanIntensity: com.androidharness.app.caveman.CavemanIntensity = com.androidharness.app.caveman.CavemanIntensity.OFF,
     val cavemanWenyan: Boolean = false,
@@ -297,13 +330,20 @@ class SettingsRepository(private val context: Context) {
         val SUBAGENT_MODEL = stringPreferencesKey("subagent_model")
         val THEME_MODE = stringPreferencesKey("theme_mode")
         val DYNAMIC_COLOR = booleanPreferencesKey("dynamic_color")
+        val DEBUG_CONSOLE_ENABLED = booleanPreferencesKey("debug_console_enabled")
+        val DEBUG_CONSOLE_BODIES = booleanPreferencesKey("debug_console_bodies")
+        val DEBUG_CONSOLE_PERSIST = booleanPreferencesKey("debug_console_persist")
+        val DEBUG_CONSOLE_CONSENT = booleanPreferencesKey("debug_console_consent")
         val COLOR_PALETTE = stringPreferencesKey("color_palette")
         val CUSTOM_PALETTES = stringPreferencesKey("custom_palettes")
+        val CUSTOM_SECTIONS = stringPreferencesKey("custom_settings_sections")
         val ACTIVE_CUSTOM_PALETTE = stringPreferencesKey("active_custom_palette")
         val HARNESS_CANVAS = stringPreferencesKey("harness_canvas")
         val HARNESS_GLASS_ENABLED = booleanPreferencesKey("harness_glass_enabled")
         val HARNESS_LIQUID_GLASS = booleanPreferencesKey("harness_liquid_glass")
         val HARNESS_GLASS_TRANSPARENCY = floatPreferencesKey("harness_glass_transparency")
+        val MOTION_BLUR_ENABLED = booleanPreferencesKey("motion_blur_enabled")
+        val MOTION_BLUR_INTENSITY = floatPreferencesKey("motion_blur_intensity")
         val PROGRESS_BAR_STYLE = stringPreferencesKey("progress_bar_style")
         val WORKSPACE_LAYOUT = stringPreferencesKey("workspace_layout")
         val EDITOR_WORD_WRAP = booleanPreferencesKey("editor_word_wrap")
@@ -335,6 +375,7 @@ class SettingsRepository(private val context: Context) {
         val SAME_MODEL_ACROSS_CHATS = booleanPreferencesKey("same_model_across_chats")
         val DISABLED_SKILLS = stringSetPreferencesKey("disabled_skills")
         val WEB_SEARCH_PROVIDER = stringPreferencesKey("web_search_provider")
+        val DISABLED_SEARCH_PROVIDERS = stringSetPreferencesKey("disabled_search_providers")
         val ALLOW_SCREENSHOTS = booleanPreferencesKey("allow_screenshots")
         val PLANNING_MODELS_ENABLED = booleanPreferencesKey("planning_models_enabled")
         val PLANNING_PROVIDER = stringPreferencesKey("planning_provider_id")
@@ -364,6 +405,7 @@ class SettingsRepository(private val context: Context) {
         val RESUME_LAST_CHAT = booleanPreferencesKey("resume_last_chat")
         val START_SCREEN = stringPreferencesKey("start_screen")
         val CHAT_KEEP_THINKING_COLLAPSED = booleanPreferencesKey("chat_keep_thinking_collapsed")
+        val CHAT_REMINDERS_ENABLED = booleanPreferencesKey("chat_reminders_enabled")
         val RUMBLE_ENABLED = booleanPreferencesKey("rumble_enabled")
         val RUMBLE_STRENGTH = intPreferencesKey("rumble_strength")
         val RUMBLE_SMOOTHNESS = intPreferencesKey("rumble_smoothness")
@@ -399,6 +441,12 @@ class SettingsRepository(private val context: Context) {
         val AUTO_CONTINUE_QUESTIONS = booleanPreferencesKey("auto_continue_questions")
         val SHOW_TODO_LIST = booleanPreferencesKey("show_todo_list")
         val SUBAGENTS_ENABLED = booleanPreferencesKey("subagents_enabled")
+        val STORAGE_ACCESS_CARDS = booleanPreferencesKey("storage_access_cards")
+        val STREAM_STALL_TIMEOUT_SECONDS = intPreferencesKey("stream_stall_timeout_seconds")
+        val STREAM_FILE_WRITES_AS_TEXT = booleanPreferencesKey("stream_file_writes_as_text")
+        val BUFFERED_TOOL_CALL_MODELS = stringSetPreferencesKey("buffered_tool_call_models")
+        val FILE_BLOCK_DECLINED_MODELS = stringSetPreferencesKey("file_block_declined_models")
+        val LEARNED_CONTEXT_LIMITS = stringSetPreferencesKey("learned_context_limits")
         val LAST_ACTIVE_SESSION = stringPreferencesKey("last_active_session_id")
         val REPO_MAP_ENABLED = booleanPreferencesKey("repo_map_enabled")
         val LOCAL_MODEL_AGENT_CONTEXT = booleanPreferencesKey("local_model_agent_context")
@@ -431,11 +479,14 @@ class SettingsRepository(private val context: Context) {
             dynamicColor = prefs[Keys.DYNAMIC_COLOR] ?: true,
             colorPalette = ThemePalette.fromStored(prefs[Keys.COLOR_PALETTE]),
             customPalettes = runCatching { kotlinx.serialization.json.Json.decodeFromString<List<CustomThemePalette>>(prefs[Keys.CUSTOM_PALETTES] ?: "[]") }.getOrDefault(emptyList()),
+            customSections = CustomSettingsSections.decode(prefs[Keys.CUSTOM_SECTIONS]),
             activeCustomPaletteId = prefs[Keys.ACTIVE_CUSTOM_PALETTE],
             harnessCanvas = runCatching { kotlinx.serialization.json.Json.decodeFromString<HarnessCanvasSettings>(prefs[Keys.HARNESS_CANVAS] ?: "{}") }.getOrDefault(HarnessCanvasSettings()),
             harnessGlassEnabled = prefs[Keys.HARNESS_GLASS_ENABLED] ?: false,
             harnessLiquidGlass = prefs[Keys.HARNESS_LIQUID_GLASS] ?: false,
             harnessGlassTransparency = (prefs[Keys.HARNESS_GLASS_TRANSPARENCY] ?: .5f).let { if (it.isFinite()) it.coerceIn(0f, 1f) else .5f },
+            motionBlurEnabled = prefs[Keys.MOTION_BLUR_ENABLED] ?: false,
+            motionBlurIntensity = (prefs[Keys.MOTION_BLUR_INTENSITY] ?: .5f).let { if (it.isFinite()) it.coerceIn(0f, 1f) else .5f },
             progressBarStyle = ProgressBarStyle.entries.firstOrNull { it.name == prefs[Keys.PROGRESS_BAR_STYLE] }
                 ?: ProgressBarStyle.FLAT,
             workspaceLayout = WorkspaceLayoutMode.fromStored(prefs[Keys.WORKSPACE_LAYOUT])
@@ -473,6 +524,7 @@ class SettingsRepository(private val context: Context) {
             webSearchProvider = prefs[Keys.WEB_SEARCH_PROVIDER]
                 ?.takeIf { it in WEB_SEARCH_PROVIDERS }
                 ?: "keyless",
+            disabledSearchProviders = prefs[Keys.DISABLED_SEARCH_PROVIDERS].orEmpty().filterTo(HashSet()) { it in WEB_SEARCH_PROVIDERS },
             allowScreenshots = prefs[Keys.ALLOW_SCREENSHOTS] ?: true,
             planningModelsEnabled = prefs[Keys.PLANNING_MODELS_ENABLED] ?: false,
             planningProviderId = prefs[Keys.PLANNING_PROVIDER],
@@ -505,6 +557,7 @@ class SettingsRepository(private val context: Context) {
             chatSearchCodeChats = prefs[Keys.CHAT_SEARCH_CODE_CHATS] ?: true,
             codeSearchChatChats = prefs[Keys.CODE_SEARCH_CHAT_CHATS] ?: true,
             chatKeepThinkingCollapsed = prefs[Keys.CHAT_KEEP_THINKING_COLLAPSED] ?: true,
+            chatRemindersEnabled = prefs[Keys.CHAT_REMINDERS_ENABLED] ?: true,
             rumbleEnabled = prefs[Keys.RUMBLE_ENABLED] ?: true,
             rumbleStrength = (prefs[Keys.RUMBLE_STRENGTH] ?: RUMBLE_DEFAULT_STRENGTH).coerceIn(0, 100),
             rumbleSmoothness = (prefs[Keys.RUMBLE_SMOOTHNESS] ?: RUMBLE_DEFAULT_SMOOTHNESS).coerceIn(0, 100),
@@ -540,6 +593,13 @@ class SettingsRepository(private val context: Context) {
             autoContinueQuestions = prefs[Keys.AUTO_CONTINUE_QUESTIONS] ?: true,
             showTodoList = prefs[Keys.SHOW_TODO_LIST] ?: true,
             subagentsEnabled = prefs[Keys.SUBAGENTS_ENABLED] ?: true,
+            storageAccessCards = prefs[Keys.STORAGE_ACCESS_CARDS] ?: true,
+            streamStallTimeoutSeconds = prefs[Keys.STREAM_STALL_TIMEOUT_SECONDS]
+                ?: com.androidharness.app.agent.StreamRetrier.DEFAULT_STALL_TIMEOUT_SECONDS,
+            streamFileWritesAsText = prefs[Keys.STREAM_FILE_WRITES_AS_TEXT] ?: true,
+            bufferedToolCallModels = prefs[Keys.BUFFERED_TOOL_CALL_MODELS] ?: emptySet(),
+            fileBlockDeclinedModels = prefs[Keys.FILE_BLOCK_DECLINED_MODELS] ?: emptySet(),
+            learnedContextLimits = decodeContextLimits(prefs[Keys.LEARNED_CONTEXT_LIMITS]),
             lastActiveSessionId = prefs[Keys.LAST_ACTIVE_SESSION],
             repoMapEnabled = prefs[Keys.REPO_MAP_ENABLED] ?: true,
             localModelAgentContext = prefs[Keys.LOCAL_MODEL_AGENT_CONTEXT] ?: false,
@@ -549,6 +609,10 @@ class SettingsRepository(private val context: Context) {
                 runCatching { com.androidharness.app.caveman.CavemanIntensity.valueOf(it) }.getOrNull()
             } ?: com.androidharness.app.caveman.CavemanIntensity.OFF,
             cavemanWenyan = prefs[Keys.CAVEMAN_WENYAN] ?: false,
+            debugConsoleEnabled = prefs[Keys.DEBUG_CONSOLE_ENABLED] ?: false,
+            debugConsoleBodies = prefs[Keys.DEBUG_CONSOLE_BODIES] ?: false,
+            debugConsolePersist = prefs[Keys.DEBUG_CONSOLE_PERSIST] ?: false,
+            debugConsoleConsent = prefs[Keys.DEBUG_CONSOLE_CONSENT] ?: false,
         )
     }
 
@@ -558,11 +622,14 @@ class SettingsRepository(private val context: Context) {
             p[Keys.DYNAMIC_COLOR] = s.dynamicColor
             p[Keys.COLOR_PALETTE] = s.colorPalette.name
             p[Keys.CUSTOM_PALETTES] = kotlinx.serialization.json.Json.encodeToString(s.customPalettes)
+            p[Keys.CUSTOM_SECTIONS] = CustomSettingsSections.encode(s.customSections)
             s.activeCustomPaletteId?.let { p[Keys.ACTIVE_CUSTOM_PALETTE] = it } ?: p.remove(Keys.ACTIVE_CUSTOM_PALETTE)
             p[Keys.HARNESS_CANVAS] = kotlinx.serialization.json.Json.encodeToString(s.harnessCanvas)
             p[Keys.HARNESS_GLASS_ENABLED] = s.harnessGlassEnabled
             p[Keys.HARNESS_LIQUID_GLASS] = s.harnessLiquidGlass
             p[Keys.HARNESS_GLASS_TRANSPARENCY] = s.harnessGlassTransparency.let { if (it.isFinite()) it.coerceIn(0f, 1f) else .5f }
+            p[Keys.MOTION_BLUR_ENABLED] = s.motionBlurEnabled
+            p[Keys.MOTION_BLUR_INTENSITY] = s.motionBlurIntensity.let { if (it.isFinite()) it.coerceIn(0f, 1f) else .5f }
             p[Keys.PROGRESS_BAR_STYLE] = s.progressBarStyle.name
             p[Keys.WORKSPACE_LAYOUT] = s.workspaceLayout.name
             p[Keys.EDITOR_WORD_WRAP] = s.editorWordWrap
@@ -588,6 +655,7 @@ class SettingsRepository(private val context: Context) {
             p[Keys.SUBAGENT_COMPLETION_NOTIFICATIONS] = s.subagentCompletionNotifications
             p[Keys.DISABLED_SKILLS] = s.disabledSkills
             p[Keys.WEB_SEARCH_PROVIDER] = s.webSearchProvider
+            p[Keys.DISABLED_SEARCH_PROVIDERS] = s.disabledSearchProviders.filterTo(HashSet()) { it in WEB_SEARCH_PROVIDERS }
             p[Keys.VOICE_ENGINE] = s.voiceEngine
             p[Keys.GROQ_WHISPER_MODEL] = s.groqWhisperModel
             p[Keys.TTS_ENGINE] = s.ttsEngine
@@ -607,6 +675,7 @@ class SettingsRepository(private val context: Context) {
             p[Keys.CHAT_SEARCH_CODE_CHATS] = s.chatSearchCodeChats
             p[Keys.CODE_SEARCH_CHAT_CHATS] = s.codeSearchChatChats
             p[Keys.CHAT_KEEP_THINKING_COLLAPSED] = s.chatKeepThinkingCollapsed
+            p[Keys.CHAT_REMINDERS_ENABLED] = s.chatRemindersEnabled
             p[Keys.RUMBLE_ENABLED] = s.rumbleEnabled
             p[Keys.RUMBLE_STRENGTH] = s.rumbleStrength.coerceIn(0, 100)
             p[Keys.RUMBLE_SMOOTHNESS] = s.rumbleSmoothness.coerceIn(0, 100)
@@ -637,6 +706,12 @@ class SettingsRepository(private val context: Context) {
             p[Keys.AUTO_CONTINUE_QUESTIONS] = s.autoContinueQuestions
             p[Keys.SHOW_TODO_LIST] = s.showTodoList
             p[Keys.SUBAGENTS_ENABLED] = s.subagentsEnabled
+            p[Keys.STORAGE_ACCESS_CARDS] = s.storageAccessCards
+            p[Keys.STREAM_STALL_TIMEOUT_SECONDS] = s.streamStallTimeoutSeconds
+            p[Keys.STREAM_FILE_WRITES_AS_TEXT] = s.streamFileWritesAsText
+            p[Keys.BUFFERED_TOOL_CALL_MODELS] = s.bufferedToolCallModels
+            p[Keys.FILE_BLOCK_DECLINED_MODELS] = s.fileBlockDeclinedModels
+            p[Keys.LEARNED_CONTEXT_LIMITS] = encodeContextLimits(s.learnedContextLimits)
             p[Keys.REPO_MAP_ENABLED] = s.repoMapEnabled
             p[Keys.LOCAL_MODEL_AGENT_CONTEXT] = s.localModelAgentContext
             p[Keys.LOCAL_MODEL_EXPERIMENTAL] = s.localModelExperimental
@@ -658,6 +733,15 @@ class SettingsRepository(private val context: Context) {
         context.settingsStore.edit { it[Keys.WEB_SEARCH_PROVIDER] = provider }
     }
 
+    /** Turns one search provider on or off for web_search. */
+    suspend fun setSearchProviderEnabled(provider: String, enabled: Boolean) {
+        if (provider !in WEB_SEARCH_PROVIDERS) return
+        context.settingsStore.edit { prefs ->
+            val disabled = prefs[Keys.DISABLED_SEARCH_PROVIDERS].orEmpty()
+            prefs[Keys.DISABLED_SEARCH_PROVIDERS] = if (enabled) disabled - provider else disabled + provider
+        }
+    }
+
     suspend fun setProviderEnabled(id: String, enabled: Boolean) {
         context.settingsStore.edit { prefs ->
             val disabled = prefs[Keys.DISABLED_PROVIDERS].orEmpty()
@@ -674,12 +758,60 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
+    suspend fun setDebugConsole(enabled: Boolean, bodies: Boolean, persist: Boolean) {
+        context.settingsStore.edit {
+            it[Keys.DEBUG_CONSOLE_ENABLED] = enabled
+            it[Keys.DEBUG_CONSOLE_BODIES] = bodies && enabled
+            it[Keys.DEBUG_CONSOLE_PERSIST] = persist && enabled
+        }
+    }
+
+    suspend fun setDebugConsent() {
+        context.settingsStore.edit { it[Keys.DEBUG_CONSOLE_CONSENT] = true }
+    }
+
     suspend fun setPermissionMode(mode: PermissionMode) {
         context.settingsStore.edit { it[Keys.PERMISSION_MODE] = mode.name }
     }
 
     suspend fun setSubagentFullAccess(enabled: Boolean) {
         context.settingsStore.edit { it[Keys.SUBAGENT_FULL_ACCESS] = enabled }
+    }
+
+    suspend fun setStorageAccessCards(enabled: Boolean) {
+        context.settingsStore.edit { it[Keys.STORAGE_ACCESS_CARDS] = enabled }
+    }
+
+    suspend fun setStreamStallTimeoutSeconds(seconds: Int) {
+        context.settingsStore.edit {
+            it[Keys.STREAM_STALL_TIMEOUT_SECONDS] =
+                if (seconds == com.androidharness.app.agent.StreamRetrier.STALL_TIMEOUT_NEVER) seconds
+                else seconds.coerceIn(
+                    com.androidharness.app.agent.StreamRetrier.MIN_STALL_TIMEOUT_SECONDS,
+                    com.androidharness.app.agent.StreamRetrier.MAX_STALL_TIMEOUT_SECONDS)
+        }
+    }
+
+    suspend fun setStreamFileWritesAsText(enabled: Boolean) {
+        context.settingsStore.edit { it[Keys.STREAM_FILE_WRITES_AS_TEXT] = enabled }
+    }
+
+    /** Remembers a model whose server delivered a whole file write in one chunk. */
+    suspend fun markBufferedToolCalls(key: String) {
+        context.settingsStore.edit { it[Keys.BUFFERED_TOOL_CALL_MODELS] = it[Keys.BUFFERED_TOOL_CALL_MODELS].orEmpty() + key }
+    }
+
+    /** Remembers a model that would not write file blocks, so it goes back to plain write_file calls. */
+    /** Remembers the input window a server named when it rejected a request from this model as too long. */
+    suspend fun learnContextLimit(key: String, tokens: Int) {
+        context.settingsStore.edit {
+            it[Keys.LEARNED_CONTEXT_LIMITS] = encodeContextLimits(
+                decodeContextLimits(it[Keys.LEARNED_CONTEXT_LIMITS]) + (key to tokens))
+        }
+    }
+
+    suspend fun markFileBlocksDeclined(key: String) {
+        context.settingsStore.edit { it[Keys.FILE_BLOCK_DECLINED_MODELS] = it[Keys.FILE_BLOCK_DECLINED_MODELS].orEmpty() + key }
     }
 
     suspend fun setSubagentsEnabled(enabled: Boolean) {
@@ -729,6 +861,14 @@ class SettingsRepository(private val context: Context) {
         kotlinx.serialization.json.Json.decodeFromString<HarnessCanvasSettings>(raw ?: "{}")
     }.getOrDefault(HarnessCanvasSettings())
 
+    /** Applies [transform] to the saved custom sections; a result that breaks the limits is dropped. */
+    suspend fun updateCustomSections(transform: (List<CustomSettingsSection>) -> List<CustomSettingsSection>) {
+        context.settingsStore.edit { prefs ->
+            val next = transform(CustomSettingsSections.decode(prefs[Keys.CUSTOM_SECTIONS]))
+            if (CustomSettingsSections.valid(next)) prefs[Keys.CUSTOM_SECTIONS] = CustomSettingsSections.encode(next)
+        }
+    }
+
     suspend fun saveCustomPalette(palette: CustomThemePalette) {
         require(palette.valid())
         context.settingsStore.edit { prefs ->
@@ -771,6 +911,15 @@ class SettingsRepository(private val context: Context) {
     suspend fun setHarnessGlassTransparency(value: Float) {
         if (!value.isFinite()) return
         context.settingsStore.edit { it[Keys.HARNESS_GLASS_TRANSPARENCY] = value.coerceIn(0f, 1f) }
+    }
+
+    suspend fun setMotionBlurEnabled(enabled: Boolean) {
+        context.settingsStore.edit { it[Keys.MOTION_BLUR_ENABLED] = enabled }
+    }
+
+    suspend fun setMotionBlurIntensity(value: Float) {
+        if (!value.isFinite()) return
+        context.settingsStore.edit { it[Keys.MOTION_BLUR_INTENSITY] = value.coerceIn(0f, 1f) }
     }
 
     suspend fun updateHarnessCanvas(transform: (HarnessCanvasSettings) -> HarnessCanvasSettings) {
@@ -1175,6 +1324,10 @@ class SettingsRepository(private val context: Context) {
         context.settingsStore.edit { it[Keys.CHAT_KEEP_THINKING_COLLAPSED] = value }
     }
 
+    suspend fun setChatRemindersEnabled(value: Boolean) {
+        context.settingsStore.edit { it[Keys.CHAT_REMINDERS_ENABLED] = value }
+    }
+
     suspend fun setRumbleEnabled(value: Boolean) {
         context.settingsStore.edit { it[Keys.RUMBLE_ENABLED] = value }
     }
@@ -1350,3 +1503,14 @@ class SettingsRepository(private val context: Context) {
         }
     }
 }
+
+/** Entries are "providerId|model=tokens"; the key itself may hold "=", so split on the last one. */
+internal fun decodeContextLimits(entries: Set<String>?): Map<String, Int> =
+    entries.orEmpty().mapNotNull { entry ->
+        val at = entry.lastIndexOf('=')
+        if (at <= 0) return@mapNotNull null
+        entry.substring(at + 1).toIntOrNull()?.takeIf { it > 0 }?.let { entry.substring(0, at) to it }
+    }.toMap()
+
+internal fun encodeContextLimits(limits: Map<String, Int>): Set<String> =
+    limits.mapTo(LinkedHashSet()) { (key, tokens) -> "$key=$tokens" }

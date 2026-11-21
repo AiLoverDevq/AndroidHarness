@@ -1,14 +1,13 @@
 package com.androidharness.app.llm
 
 import com.androidharness.app.agent.RetryPolicy
+import com.androidharness.app.agent.StreamRetrier
 import com.androidharness.app.agent.TaskBudget
 import com.androidharness.app.agent.ThinkingSpecs
 import com.androidharness.app.agent.stallGuard
 import com.androidharness.app.core.ChatMessage
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.flow
@@ -39,7 +38,9 @@ class FallbackProvider(
     private val keyFor: suspend (ProviderConfig) -> String,
     private val destination: (ProviderConfig) -> String = { it.baseUrl.trimEnd('/').lowercase() },
     private val sleep: suspend (Long) -> Unit = { delay(it) },
-    private val stallTimeoutMs: Long = 90_000,
+    private val stallTimeoutMs: Long = com.androidharness.app.agent.StreamRetrier.DEFAULT_STALL_TIMEOUT_MS,
+    /** The live Settings value; read per attempt so a change applies on the next request. */
+    private val currentStallTimeoutMs: (suspend () -> Long)? = null,
 ) : LlmProvider {
     private var primary: ProviderConfig? = null
     private var managedChanged = false
@@ -54,6 +55,10 @@ class FallbackProvider(
         val original = primary ?: config.also { primary = it }
         val tried = mutableSetOf(FallbackTarget(current.id, current.model), FallbackTarget(original.id, original.model))
         var attempts = 0
+        // One group per turn keeps every retry and failover attempt together in the console.
+        val debugGroup = options.debugGroup ?: java.util.UUID.randomUUID().toString()
+        // Counts every send of this turn, including failover hops (attempts resets per provider).
+        var debugAttempts = 0
         var lastFailure: StreamEvent.Failure? = null
         val initialPolicy = consent.policy()
         val approvedPrimary = consent.primary ?: original
@@ -105,17 +110,20 @@ class FallbackProvider(
                 emit(StreamEvent.Failure("Fallback routing changed. Review Fallbacks before continuing.", retryable = false))
                 return@flow
             }
-            val timeout = if (com.androidharness.app.local.LocalModelCatalog.isLocal(current.id)) 600_000 else stallTimeoutMs
+            val timeout = if (com.androidharness.app.local.LocalModelCatalog.isLocal(current.id)) 600_000 else currentStallTimeoutMs?.invoke() ?: stallTimeoutMs
+            // What this attempt actually asks the model to reason with, so the
+            // stall guard's first-output window matches the work requested.
+            val attemptThinking = ThinkingSpecs.resolvedForModel(current.model, options.thinking,
+                ModelsDev.providerKeyFor(current.baseUrl)).level
             flow {
                 factory(current).streamChat(current, key, systemPrompt, messages, tools,
-                    options.copy(thinking = ThinkingSpecs.resolvedForModel(current.model, options.thinking, ModelsDev.providerKeyFor(current.baseUrl)).level))
+                    options.copy(thinking = attemptThinking,
+                        debugGroup = debugGroup, debugAttempt = ++debugAttempts))
                     .collect { emit(it) }
-            }.flattenEvents().stallGuard(timeout).catch { e ->
+            }.flattenEvents().stallGuard(timeout, StreamRetrier.firstOutputWindow(timeout, attemptThinking, current)).catch { e ->
                 when (e) {
-                    is TimeoutCancellationException -> {
-                        coroutineContext.ensureActive()
-                        emit(StreamEvent.Failure("Generation stalled (timed out)"))
-                    }
+                    is com.androidharness.app.agent.StreamStalledException ->
+                        emit(StreamEvent.Failure(com.androidharness.app.agent.stalledMessage(e.silentMs)))
                     is CancellationException -> throw e
                     is com.androidharness.app.agent.TaskPaused -> throw e
                     else -> {

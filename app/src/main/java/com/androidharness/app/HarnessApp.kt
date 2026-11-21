@@ -44,8 +44,18 @@ class HarnessApp : Application() {
         // Paused LazyColumn prefetch crashes in LayoutNode.onChildRemoved when chat items change.
         ComposeFoundationFlags.isPausableCompositionInPrefetchEnabled = false
         WebView.enableSlowWholeDocumentDraw()
+        // Before any workspace is resolved, so no tool ever sees a filtered shared-storage tree.
+        com.androidharness.app.data.env.StorageGate.install(packageName,
+            granted = { com.androidharness.app.data.env.StorageAccess.isGranted(this) })
         container = AppContainer(this)
+        com.androidharness.app.data.env.StorageGate.installPrivilegedRoute { cwd ->
+            container.deviceAccess.liveTier(cwd).let {
+                it == com.androidharness.app.data.env.ExecutionTier.ROOT || it == com.androidharness.app.data.env.ExecutionTier.PRIVILEGED
+            }
+        }
         memoryScope.launch { container.settings.ensureRumbleCombo() }
+        // A force stop clears every alarm without telling the app, so set them again on each start.
+        memoryScope.launch { runCatching { container.reminders.rescheduleAll() } }
     }
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
@@ -81,6 +91,44 @@ class AppContainer(val appContext: Context) {
     val keys = KeyStoreManager(appContext)
     init { com.androidharness.app.llm.ProviderNetwork.settings = keys::providerProxy }
     val settings = SettingsRepository(appContext)
+
+    /** Durable request log; opened lazily so a user who never enables it pays nothing. */
+    val debugLog: com.androidharness.app.llm.debug.DebugLogRepository by lazy {
+        com.androidharness.app.llm.debug.DebugLogRepository(
+            com.androidharness.app.llm.debug.DebugLogDatabase.open(appContext).dao(),
+        ) { id -> db.dao().session(id)?.title }
+    }
+
+    @Volatile private var debugPersist = false
+
+    init {
+        // Provider debug console: persisted switches. History lives in its own database,
+        // so nothing has to be restored into memory at startup.
+        val debugCapture = com.androidharness.app.llm.debug.DebugCapture
+        // The file-based archive is gone; drop its leftover so no old log lingers.
+        runCatching { java.io.File(appContext.filesDir, "provider-debug-traces.enc").delete() }
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO).launch {
+            settings.settings.collect { value ->
+                debugCapture.enabled = value.debugConsoleEnabled
+                debugCapture.captureBodies = value.debugConsoleBodies
+                debugPersist = value.debugConsolePersist && value.debugConsoleEnabled
+            }
+        }
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO).launch {
+            // A live stream republishes every half second; debounce the write so a
+            // running answer does not hit SQLite on every event.
+            var pending: kotlinx.coroutines.Job? = null
+            debugCapture.store.traces.collect { traces ->
+                if (!debugPersist) return@collect
+                pending?.cancel()
+                pending = launch {
+                    kotlinx.coroutines.delay(800)
+                    debugLog.save(traces)
+                    debugLog.prune()
+                }
+            }
+        }
+    }
     private val configurationRevision = kotlinx.coroutines.flow.MutableStateFlow(0L)
     val pluginManager = com.androidharness.app.plugins.PluginManager(appContext, configurationRevision,
         com.androidharness.app.plugins.PluginDownloads(githubToken = { github.accessToken() })) { pluginRuntime }
@@ -102,11 +150,22 @@ class AppContainer(val appContext: Context) {
     }
     val configuration = com.androidharness.app.config.HarnessConfigRepository(appContext, keys, pluginManager, configurationRevision)
     val pluginHooks = com.androidharness.app.config.PluginHooks(appContext) { linuxEnv.shellProcessBuilder(it) }
+    init {
+        // Plugins with automatic updates are checked shortly after start, away from the first screen's work.
+        kotlinx.coroutines.CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            kotlinx.coroutines.delay(30_000)
+            runCatching { pluginManager.autoUpdate() }
+        }
+    }
     internal val runtimePolicy = AppRuntimePolicy(appContext, settings)
     /** Voice providers (speech-to-text and text-to-speech) with per-provider keys. */
     val voiceProviders = com.androidharness.app.data.audio.VoiceProviderRepository(appContext, keys)
+    /** Microsoft Edge voice catalogue, cached on disk for a day. */
+    val edgeVoices = com.androidharness.app.data.audio.EdgeVoiceCatalog(appContext)
+    /** Keeps the advertised Edge build current so read-aloud is not refused. */
+    val edgeVersion = com.androidharness.app.data.audio.EdgeVersionProvider(appContext)
     /** Reads assistant replies with Android TTS or the selected voice provider. */
-    val tts = com.androidharness.app.data.audio.TtsController(appContext, settings, keys, voiceProviders)
+    val tts = com.androidharness.app.data.audio.TtsController(appContext, settings, keys, voiceProviders, edgeVoices, edgeVersion)
     internal val editorScope = kotlinx.coroutines.CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     internal val editorDrafts = com.androidharness.app.ui.files.EditorDraftStore(
         java.io.File(appContext.noBackupFilesDir, "editor-drafts"), editorScope)
@@ -139,7 +198,7 @@ class AppContainer(val appContext: Context) {
 
     private val db = Room.databaseBuilder(appContext, AppDatabase::class.java, "harness.db")
         .addMigrations(
-            AppDatabase.MIGRATION_24_25, AppDatabase.MIGRATION_23_24, AppDatabase.MIGRATION_22_23, AppDatabase.MIGRATION_21_22, AppDatabase.MIGRATION_20_21, AppDatabase.MIGRATION_19_20, AppDatabase.MIGRATION_18_19, AppDatabase.MIGRATION_4_5, AppDatabase.MIGRATION_5_6,
+            AppDatabase.MIGRATION_26_27, AppDatabase.MIGRATION_25_26, AppDatabase.MIGRATION_24_25, AppDatabase.MIGRATION_23_24, AppDatabase.MIGRATION_22_23, AppDatabase.MIGRATION_21_22, AppDatabase.MIGRATION_20_21, AppDatabase.MIGRATION_19_20, AppDatabase.MIGRATION_18_19, AppDatabase.MIGRATION_4_5, AppDatabase.MIGRATION_5_6,
             AppDatabase.MIGRATION_6_7, AppDatabase.MIGRATION_7_8,
             AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18,
         )
@@ -188,11 +247,25 @@ class AppContainer(val appContext: Context) {
         projectForSession = { sessions.session(it)?.projectId }, dhizuku = dhizuku)
     val shellRouter = com.androidharness.app.data.env.ShellTierRouter(appContext, shizuku, linuxEnv, deviceAccess)
     val codeGraph = com.androidharness.app.data.env.CodeGraphManager(linuxEnv, shellRouter)
+    private val deployScope = kotlinx.coroutines.CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     init {
         // Package-set changes must invalidate the deployed-copy cache, or the
         // privileged tier keeps serving the old toolchain until a restart.
-        linuxEnv.deployStateListener = { shizuku.invalidateDeployState() }
+        // The new package set is also re-staged and deployed right away, in the
+        // background, so the work overlaps the model's next turn instead of
+        // stalling the first privileged shell command after an install.
+        linuxEnv.deployStateListener = {
+            shizuku.invalidateDeployState()
+            if (shizuku.state.value == com.androidharness.app.data.env.ShizukuState.GRANTED &&
+                shizuku.serviceState.value.isReady
+            ) {
+                deployScope.launch {
+                    runCatching { linuxEnv.ensureShellDeploy(shizuku) }
+                        .onFailure { android.util.Log.e("HarnessApp", "background shell-tier deploy failed", it) }
+                }
+            }
+        }
     }
 
     val updates = com.androidharness.app.data.update.UpdateManager(appContext, deviceAccess)
@@ -212,18 +285,27 @@ class AppContainer(val appContext: Context) {
     private var projectSkillsDir: java.io.File? = null
     private val disabledSkills = AtomicReference<Set<String>>(emptySet())
     private val webSearchProvider = AtomicReference("keyless")
+    private val disabledSearchProviders = AtomicReference<Set<String>>(emptySet())
     private val searchKeyMigrated = AtomicBoolean(false)
 
     /**
-     * web_search backend config, resolved per call so Settings changes apply
-     * to the very next search without a restart. Null = keyless engines.
+     * Every search provider web_search may use, resolved per call so Settings changes
+     * apply to the very next search without a restart. Tool descriptions read this
+     * without rotating keys so listing the tools does not skip a key's turn.
      */
+    val searchSetup: com.androidharness.app.tools.SearchSetup
+        get() = buildSearchSetup(disabledSearchProviders.get(), rotate = false)
+
+    /** The provider web_fetch borrows page extraction from: Tavily when it is on, else the first ready one. */
     val searchApiConfig: com.androidharness.app.tools.SearchApiConfig?
-        get() {
-            val provider = webSearchProvider.get()
-            if (provider == "keyless") return null
-            return searchApiConfigFor(provider, rotate = false).takeIf { it.keys.isNotEmpty() }
+        get() = searchSetup.let { it.config("tavily") ?: it.apis.firstOrNull() }
+
+    private fun buildSearchSetup(disabled: Set<String>, rotate: Boolean): com.androidharness.app.tools.SearchSetup {
+        val apis = com.androidharness.app.tools.SearchProviders.apis.filter { it.id !in disabled }.mapNotNull { info ->
+            searchApiConfigFor(info.id, rotate).takeIf { it.keys.isNotEmpty() || info.sharedKey != null }
         }
+        return com.androidharness.app.tools.SearchSetup(apis, keyless = com.androidharness.app.tools.SearchProviders.KEYLESS !in disabled)
+    }
 
     /**
      * Enabled keys in this call's order: rotation moves the start key, the rest are
@@ -237,13 +319,16 @@ class AppContainer(val appContext: Context) {
         return com.androidharness.app.tools.SearchApiConfig(provider, ordered.firstOrNull().orEmpty(), ordered.drop(1))
     }
 
-    private suspend fun resolveSearchApiConfig(): com.androidharness.app.tools.SearchApiConfig? {
-        val provider = settings.settings.first().webSearchProvider
-        keys.migrateLegacySearchKey(provider)
-        webSearchProvider.set(provider)
-        if (provider == "keyless") return null
-        return searchApiConfigFor(provider)
+    private suspend fun resolveSearchSetup(): com.androidharness.app.tools.SearchSetup {
+        val current = settings.settings.first()
+        keys.migrateLegacySearchKey(current.webSearchProvider)
+        webSearchProvider.set(current.webSearchProvider)
+        disabledSearchProviders.set(current.disabledSearchProviders)
+        return buildSearchSetup(current.disabledSearchProviders, rotate = true)
     }
+
+    private suspend fun resolveSearchApiConfig(): com.androidharness.app.tools.SearchApiConfig? =
+        resolveSearchSetup().let { it.config("tavily") ?: it.apis.firstOrNull() }
 
     private val cavemanSettings = AtomicReference(com.androidharness.app.data.AppSettings())
     val skills = com.androidharness.app.skills.SkillStore(
@@ -262,6 +347,8 @@ class AppContainer(val appContext: Context) {
         browserController = browser,
         searchApi = { searchApiConfig },
         searchApiRefresh = ::resolveSearchApiConfig,
+        searchSetup = { searchSetup },
+        searchSetupRefresh = ::resolveSearchSetup,
         artifactLoader = sessions::artifacts,
         toolOutputLoader = sessions::toolOutput,
         fileHistory = fileHistory,
@@ -272,6 +359,19 @@ class AppContainer(val appContext: Context) {
         pullRequests = { githubRepositories },
         sessionMessages = { sessions.messages(it) },
         appSettings = settings,
+        plugins = pluginManager,
+        // Declared below; resolved on each call, after construction.
+        automations = com.androidharness.app.tools.AutomationToolHost(
+            target = { sid ->
+                val session = sessions.session(sid)
+                val project = session?.projectId?.let { db.dao().project(it) }
+                if (project == null) null else {
+                    val provider = runManager.controls.flow(sid).value.provider
+                    com.androidharness.app.tools.AutomationTarget(project.id, project.name, provider?.id, provider?.model)
+                }
+            },
+            manager = { automation },
+        ),
     )
     val mcp = com.androidharness.app.tools.mcp.McpManager(appContext, linuxEnv, keys, codeGraph, configuration)
     val github = com.androidharness.app.github.GitHubAuth(BuildConfig.GITHUB_CLIENT_ID,
@@ -297,6 +397,9 @@ class AppContainer(val appContext: Context) {
                         com.androidharness.app.llm.HarnessProvider.pool[config.model]?.baseUrl ?: config.baseUrl
                     else config.baseUrl
                 },
+                currentStallTimeoutMs = {
+                    com.androidharness.app.agent.StreamRetrier.stallTimeoutMs(settings.settings.first().streamStallTimeoutSeconds)
+                },
         )
 
     val engine: AgentEngine = AgentEngine(
@@ -309,6 +412,9 @@ class AppContainer(val appContext: Context) {
         skills = skills,
         resolveConfiguration = { configuration.load(it) },
         pluginHooks = pluginHooks,
+        markBufferedToolCalls = { settings.markBufferedToolCalls(it) },
+        markFileBlocksDeclined = { settings.markFileBlocksDeclined(it) },
+        learnContextLimit = { key, tokens -> settings.learnContextLimit(key, tokens) },
         todoStore = todoStore,
         repoMap = repoMap,
         cavemanSettings = { settings.settings.first().also { cavemanSettings.set(it); disabledSkills.set(it.disabledSkills) } },
@@ -335,7 +441,10 @@ class AppContainer(val appContext: Context) {
             com.androidharness.app.tools.OfferCodeHandoffTool(),
             com.androidharness.app.tools.GitHubApiTool(fetchClient) { github.accessToken() },
             com.androidharness.app.tools.GitHubSearchTool(fetchClient) { github.accessToken() },
-            com.androidharness.app.tools.GitHubFileTool(fetchClient) { github.accessToken() }),
+            com.androidharness.app.tools.GitHubFileTool(fetchClient) { github.accessToken() }) +
+            // Resolved on each call: the manager is declared below.
+            com.androidharness.app.tools.ReminderTools.all({ reminders }, { clockAlarms }),
+        remindersEnabled = { settings.settings.first().chatRemindersEnabled },
     )
     val runManager = com.androidharness.app.agent.RunManager(
         context = appContext,
@@ -354,6 +463,8 @@ class AppContainer(val appContext: Context) {
     )
     val githubRepositories = com.androidharness.app.github.GitHubWorkspaces(this)
     val automation = com.androidharness.app.automation.AutomationManager(this)
+    val reminders = com.androidharness.app.reminders.ReminderManager(appContext)
+    val clockAlarms = com.androidharness.app.reminders.ClockAlarms(appContext)
     val projectDeletion = com.androidharness.app.workspace.ProjectDeletion(this)
     internal var telegram = com.androidharness.app.telegram.TelegramManager(this)
     val interactiveTerminal = com.androidharness.app.terminal.InteractiveTerminalManager(linuxEnv, runManager)
@@ -396,6 +507,10 @@ class AppContainer(val appContext: Context) {
                 }
         }
         kotlinx.coroutines.CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            // Chats that held several workspaces before projects existed each move into a project of their own.
+            runCatching { workspace.adoptUnfiledChats() }
+        }
+        kotlinx.coroutines.CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             // Learned wire per Harness model (chat vs anthropic vs responses),
             // persisted by the first-request probe; mirrored into memory so
             // every request path reads it synchronously.
@@ -426,6 +541,7 @@ class AppContainer(val appContext: Context) {
                     keys.migrateLegacySearchKey(it.webSearchProvider)
                 }
                 webSearchProvider.set(it.webSearchProvider)
+                disabledSearchProviders.set(it.disabledSearchProviders)
             }
         }
         kotlinx.coroutines.CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {

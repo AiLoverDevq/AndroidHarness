@@ -109,6 +109,8 @@ class MainActivity : AppCompatActivity() {
                 glassEnabled = currentSettings.harnessGlassEnabled,
                 liquidGlass = currentSettings.harnessLiquidGlass,
                 glassTransparency = currentSettings.harnessGlassTransparency,
+                motionBlurEnabled = currentSettings.motionBlurEnabled,
+                motionBlurIntensity = currentSettings.motionBlurIntensity,
             ) {
                 // Biometric lock prompt on start / when enabled.
                 LaunchedEffect(currentSettings.biometricLockEnabled) {
@@ -178,6 +180,7 @@ class MainActivity : AppCompatActivity() {
                         onDispose { container.browser.unbindReadCaptureHost(host) }
                     }
                     AppNav(container)
+                    com.androidharness.app.ui.common.StorageAccessPrompt()
                 }
 
                 // The one global update dialog, above everything else.

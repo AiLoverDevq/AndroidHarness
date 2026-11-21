@@ -67,6 +67,8 @@ class TtsController(
     private val settings: SettingsRepository,
     private val keys: KeyStoreManager,
     private val voices: VoiceProviderRepository,
+    private val edgeCatalog: EdgeVoiceCatalog,
+    private val edgeVersion: EdgeVersionProvider,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val audioManager = context.getSystemService(AudioManager::class.java)
@@ -126,6 +128,16 @@ class TtsController(
         speak(PREVIEW_ID, context.getString(R.string.settings_tts_test_sentence))
     }
 
+    /**
+     * Plays the sample sentence in one voice of the engine in use, without saving
+     * it, so a voice picker can let the user listen before choosing. Models and
+     * speed are the saved ones; the clip cache makes a second listen instant.
+     */
+    fun previewVoice(voiceId: String) {
+        autoQueue.clear()
+        speak(sampleId(voiceId), context.getString(R.string.settings_tts_test_sentence), voiceOverride = voiceId)
+    }
+
     fun stop() {
         autoQueue.clear()
         halt()
@@ -161,16 +173,44 @@ class TtsController(
         return VoiceGateway.ttsModels(provider, key)
     }
 
-    /** Voices of the configured provider, or of the installed engine for "system". */
+    /**
+     * Voices of the configured provider. Edge gets its full catalogue grouped by
+     * language; ElevenLabs asks the account; the rest use documented voices.
+     */
     suspend fun providerVoices(providerId: String?, model: String): List<TtsVoiceOption> {
         val provider = voices.byId(providerId) ?: return emptyList()
-        if (provider.protocol == VoiceProtocol.ELEVENLABS) {
-            val key = keys.voiceApiKey(provider.id).orEmpty()
-            val remote = ElevenLabsClient.voices(provider.resolvedBaseUrl(), key).getOrNull()
-            if (!remote.isNullOrEmpty()) return remote.map { TtsVoiceOption(it.id, it.name) }
+        when (provider.protocol) {
+            VoiceProtocol.ELEVENLABS -> {
+                val key = keys.voiceApiKey(provider.id).orEmpty()
+                val remote = ElevenLabsClient.voices(provider.resolvedBaseUrl(), key).getOrNull()
+                if (!remote.isNullOrEmpty()) return remote.map { TtsVoiceOption(it.id, it.name) }
+            }
+            VoiceProtocol.CARTESIA -> {
+                val key = keys.voiceApiKey(provider.id).orEmpty()
+                val remote = CartesiaClient.voices(provider.resolvedBaseUrl(), key).getOrNull()
+                if (!remote.isNullOrEmpty()) return remote.map { TtsVoiceOption(it.first, it.second) }
+            }
+            VoiceProtocol.EDGE -> {
+                // Edge voices are grouped by language; flatten for the plain list
+                // API, keeping the group order so related voices stay together.
+                val groups = edgeCatalog.group(edgeCatalog.voices())
+                return groups.flatMap { group ->
+                    group.voices.map { voice ->
+                        TtsVoiceOption(voice.shortName, "${voice.displayName} · ${group.title}")
+                    }
+                }
+            }
+            else -> Unit
         }
         return VoiceGateway.voicesFor(provider, model).map { TtsVoiceOption(it, voiceLabel(it)) }
     }
+
+    /** Edge voices grouped by language, for the sectioned picker. */
+    suspend fun edgeVoiceGroups(): List<EdgeVoiceGroup> = edgeCatalog.group(edgeCatalog.voices())
+
+    /** Forces a catalogue refresh; used by the picker's refresh action. */
+    suspend fun refreshEdgeVoices(): List<EdgeVoiceGroup> =
+        edgeCatalog.group(edgeCatalog.voices(forceRefresh = true))
 
     /** "pt-BR-FranciscaNeural" reads better as "Francisca · pt-BR". */
     private fun voiceLabel(id: String): String {
@@ -196,7 +236,8 @@ class TtsController(
             .map { TtsVoiceOption(it.name, "${it.name.replace('_', ' ')} · ${it.locale.displayName}") }
     }
 
-    private fun speak(messageId: String, text: String) {
+    /** [voiceOverride] speaks in that voice instead of the saved one; blank means the engine default. */
+    private fun speak(messageId: String, text: String, voiceOverride: String? = null) {
         val plain = SpeechText.forSpeech(RichResponse.plainText(text))
         if (!SpeechText.isSpeakable(plain)) return
         halt()
@@ -208,9 +249,10 @@ class TtsController(
                 if (saved.ttsEngine != AppSettings.TTS_ENGINE_SYSTEM && provider == null) {
                     report(R.string.tts_error_unavailable)
                 } else if (provider != null) {
-                    speakProvider(messageId, plain, saved, provider)
+                    speakProvider(messageId, plain, saved, provider, voiceOverride)
                 } else {
-                    speakSystem(messageId, plain, saved)
+                    val effective = if (voiceOverride != null) saved.copy(ttsSystemVoice = voiceOverride.ifBlank { null }) else saved
+                    speakSystem(messageId, plain, effective)
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -255,7 +297,13 @@ class TtsController(
         text: String,
         saved: AppSettings,
         provider: VoiceProviderConfig,
+        voiceOverride: String? = null,
     ): Boolean = coroutineScope {
+        // Edge refuses clients advertising an outdated build, so make sure the
+        // advertised one is current before the first request.
+        if (provider.protocol == VoiceProtocol.EDGE) {
+            runCatching { edgeVersion.ensureFresh() }
+        }
         val apiKey = keys.voiceApiKey(provider.id).orEmpty()
         // Free endpoints (Edge) authenticate elsewhere or not at all.
         if (apiKey.isBlank() && provider.requiresKey) {
@@ -265,7 +313,8 @@ class TtsController(
         // An empty saved model is meaningful for Edge, so fall back only when
         // the key is absent from the map entirely.
         val model = selection?.ttsModel ?: provider.ttsModel
-        val voice = selection?.ttsVoice?.ifBlank { null }
+        val voice = voiceOverride?.ifBlank { null }
+            ?: selection?.ttsVoice?.ifBlank { null }
             ?: VoiceGateway.defaultVoiceFor(provider, model)
             ?: provider.ttsVoice
         val chunks = TtsTextChunker.chunk(text, VoiceGateway.maxInputChars(provider, model))
@@ -283,6 +332,11 @@ class TtsController(
                 permits.withPermit {
                     VoiceGateway.synthesizeCached(
                         context.cacheDir, provider, apiKey, chunk, model, voice, saved.ttsSpeed,
+                        // A refused handshake usually means the advertised Edge
+                        // build is stale, so refresh it and let the client retry.
+                        onEdgeForbidden = if (provider.protocol == VoiceProtocol.EDGE) {
+                            { edgeVersion.refresh() }
+                        } else null,
                     )
                 }
             }
@@ -463,5 +517,10 @@ class TtsController(
 
     companion object {
         const val PREVIEW_ID = "__tts_preview__"
+
+        /** Message ids of voice samples start with this, followed by the voice id. */
+        const val SAMPLE_PREFIX = "__tts_voice_sample__:"
+
+        fun sampleId(voiceId: String): String = SAMPLE_PREFIX + voiceId
     }
 }

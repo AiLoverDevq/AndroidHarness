@@ -16,24 +16,28 @@ object VoiceGateway {
             VoiceProtocol.DEEPGRAM -> DeepgramVoiceClient.validateKey(provider.resolvedBaseUrl(), apiKey)
             VoiceProtocol.CARTESIA -> CartesiaClient.validateKey(provider.resolvedBaseUrl(), apiKey)
             VoiceProtocol.ASSEMBLYAI -> AssemblyAiClient.validateKey(provider.resolvedBaseUrl(), apiKey)
+            // Edge needs no credential, so there is nothing to validate.
+            VoiceProtocol.EDGE -> Result.success(Unit)
         }
 
     /** Model ids the provider can serve, or the shipped preset list as a fallback. */
     suspend fun sttModels(provider: VoiceProviderConfig, apiKey: String): List<String> {
         val preset = VoicePresets.sttModelsFor(provider)
         return when (provider.protocol) {
-            VoiceProtocol.OPENAI_AUDIO, VoiceProtocol.DEEPGRAM -> {
+            VoiceProtocol.OPENAI_AUDIO -> {
                 val remote = runCatching {
                     if (apiKey.isBlank() && provider.requiresKey) emptyList()
                     else OpenAiAudioClient.listModels(provider.resolvedBaseUrl(), apiKey).getOrDefault(emptyList())
                 }.getOrDefault(emptyList())
-                val filtered = remote.filter { id ->
-                    when (provider.protocol) {
-                        VoiceProtocol.DEEPGRAM -> remote.isNotEmpty()
-                        else -> VOICE_STT_HINT.containsMatchIn(id)
-                    }
-                }
-                (filtered + preset).distinct()
+                (remote.filter { VOICE_STT_HINT.containsMatchIn(it) } + preset).distinct()
+            }
+            // Deepgram reports both directions from one endpoint.
+            VoiceProtocol.DEEPGRAM -> {
+                val remote = runCatching {
+                    if (apiKey.isBlank()) emptyList()
+                    else DeepgramVoiceClient.models(provider.resolvedBaseUrl(), apiKey).getOrDefault(emptyList())
+                }.getOrDefault(emptyList())
+                (remote.filter { VOICE_STT_HINT.containsMatchIn(it) } + preset).distinct()
             }
             else -> preset
         }
@@ -48,6 +52,20 @@ object VoiceGateway {
                     else OpenAiAudioClient.listModels(provider.resolvedBaseUrl(), apiKey).getOrDefault(emptyList())
                 }.getOrDefault(emptyList())
                 (remote.filter { TTS_HINT.containsMatchIn(it) } + preset).distinct()
+            }
+            VoiceProtocol.DEEPGRAM -> {
+                val remote = runCatching {
+                    if (apiKey.isBlank()) emptyList()
+                    else DeepgramVoiceClient.models(provider.resolvedBaseUrl(), apiKey).getOrDefault(emptyList())
+                }.getOrDefault(emptyList())
+                (remote.filter { TTS_HINT.containsMatchIn(it) } + preset).distinct()
+            }
+            VoiceProtocol.ELEVENLABS -> {
+                val remote = runCatching {
+                    if (apiKey.isBlank()) emptyList()
+                    else ElevenLabsClient.models(provider.resolvedBaseUrl(), apiKey).getOrDefault(emptyList())
+                }.getOrDefault(emptyList())
+                (remote + preset).distinct()
             }
             else -> preset
         }
@@ -71,6 +89,8 @@ object VoiceGateway {
         }
         VoiceProtocol.CARTESIA ->
             Result.failure(UnsupportedOperationException("Cartesia does not offer speech to text"))
+        VoiceProtocol.EDGE ->
+            Result.failure(UnsupportedOperationException("Edge does not offer speech to text"))
     }
 
     suspend fun synthesizeCached(
@@ -81,6 +101,7 @@ object VoiceGateway {
         model: String,
         voice: String,
         speed: Float,
+        onEdgeForbidden: (suspend () -> Unit)? = null,
     ): Result<File> = OpenAiAudioClient.synthesizeCached(
         cacheDir = cacheDir,
         provider = provider,
@@ -89,6 +110,7 @@ object VoiceGateway {
         model = model,
         voice = voice,
         speed = speed,
+        onEdgeForbidden = onEdgeForbidden,
     )
 
     fun voicesFor(provider: VoiceProviderConfig, model: String): List<String> =

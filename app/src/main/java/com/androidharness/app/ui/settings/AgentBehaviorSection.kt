@@ -1,6 +1,5 @@
 package com.androidharness.app.ui.settings
 
-import com.androidharness.app.ui.theme.HarnessGlassSwitch as Switch
 import com.androidharness.app.ui.common.localizedOption
 import android.os.Build
 import androidx.lifecycle.Lifecycle
@@ -14,14 +13,14 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
-import androidx.compose.material.icons.automirrored.outlined.Send
-import androidx.compose.material.icons.outlined.ChatBubbleOutline
-import androidx.compose.material.icons.outlined.Description
-import androidx.compose.material.icons.outlined.Notifications
-import androidx.compose.material.icons.outlined.Replay
-import androidx.compose.material.icons.outlined.Security
-import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.rounded.Send
+import androidx.compose.material.icons.rounded.ChatBubbleOutline
+import androidx.compose.material.icons.rounded.Description
+import androidx.compose.material.icons.rounded.Notifications
+import androidx.compose.material.icons.rounded.Replay
+import androidx.compose.material.icons.rounded.Security
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -40,7 +39,6 @@ import com.androidharness.app.ui.chat.ResumePromptSheet
 import com.androidharness.app.data.AppSettings
 import com.androidharness.app.data.SteeringMode
 import com.androidharness.app.data.AgentSettingsAccess
-import androidx.compose.material.icons.outlined.Tune
 import com.androidharness.app.R
 import com.androidharness.app.ui.chat.components.FullAccessOrange
 import com.androidharness.app.ui.common.BiometricAuth
@@ -104,6 +102,8 @@ internal fun AgentBehaviorSection(
     /** Blank restores the built-in resume prompt. */
     onResumePrompt: (String) -> Unit = {},
     onAgentSettingsAccess: (AgentSettingsAccess) -> Unit = {},
+    onStallTimeout: (Int) -> Unit = {},
+    onStreamFileWrites: (Boolean) -> Unit = {},
     /**
      * Test/preview override for the device-owner check guarding full access.
      * Production callers leave this null so the real biometric/PIN prompt runs.
@@ -114,6 +114,7 @@ internal fun AgentBehaviorSection(
     var autoCompactText by rememberSaveable { mutableStateOf("") }
     var autoCompactError by rememberSaveable { mutableStateOf(false) }
     var editResumePrompt by rememberSaveable { mutableStateOf(false) }
+    var editStallTimeout by rememberSaveable { mutableStateOf(false) }
     var pickerName by rememberSaveable { mutableStateOf<String?>(null) }
     val picker = pickerName?.let(BehaviorPicker::valueOf)
     val context = LocalContext.current
@@ -126,7 +127,7 @@ internal fun AgentBehaviorSection(
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        BehaviorGroup(stringResource(R.string.settings_agent_group_permissions), Icons.Outlined.Security) {
+        BehaviorGroup(stringResource(R.string.settings_agent_group_permissions), Icons.Rounded.Security) {
             SettingsAnchor(R.string.settings_anchor_default_permission) {
                 BehaviorValueRow(
                     title = stringResource(R.string.settings_anchor_default_permission),
@@ -137,7 +138,7 @@ internal fun AgentBehaviorSection(
                 )
             }
         }
-        BehaviorGroup(stringResource(R.string.settings_agent_group_run_limits), Icons.Outlined.Tune) {
+        BehaviorGroup(stringResource(R.string.settings_agent_group_run_limits), Icons.Rounded.Tune) {
             SettingsAnchor(R.string.settings_anchor_max_context) {
                 BehaviorValueRow(
                     title = stringResource(R.string.settings_anchor_max_context),
@@ -170,8 +171,35 @@ internal fun AgentBehaviorSection(
                     onClick = { pickerName = BehaviorPicker.ITERATIONS.name },
                 )
             }
+            BehaviorDivider()
+            SettingsAnchor(R.string.stall_timeout_title) {
+                BehaviorValueRow(
+                    title = stringResource(R.string.stall_timeout_title),
+                    value = stallTimeoutLabel(settings.streamStallTimeoutSeconds),
+                    description = stringResource(R.string.stall_timeout_subtitle),
+                    onClick = { editStallTimeout = true },
+                )
+            }
+            BehaviorDivider()
+            SettingsAnchor(R.string.stream_writes_title) {
+                Row(
+                    Modifier.fillMaxWidth().clickable(role = Role.Switch) { onStreamFileWrites(!settings.streamFileWritesAsText) }.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(stringResource(R.string.stream_writes_title), style = MaterialTheme.typography.titleSmall)
+                        Text(stringResource(R.string.stream_writes_desc), style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (settings.bufferedToolCallModels.isNotEmpty()) Text(
+                            stringResource(R.string.stream_writes_detected, settings.bufferedToolCallModels.size),
+                            style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                    }
+                    Switch(checked = settings.streamFileWritesAsText, onCheckedChange = null)
+                }
+            }
         }
-        BehaviorGroup(stringResource(R.string.resume_prompt_group), Icons.Outlined.Replay) {
+        BehaviorGroup(stringResource(R.string.resume_prompt_group), Icons.Rounded.Replay) {
             SettingsAnchor(R.string.resume_prompt_title) {
                 BehaviorValueRow(
                     title = stringResource(R.string.resume_prompt_title),
@@ -181,7 +209,7 @@ internal fun AgentBehaviorSection(
                 )
             }
         }
-        BehaviorGroup(stringResource(R.string.steering_group), Icons.AutoMirrored.Outlined.Send) {
+        BehaviorGroup(stringResource(R.string.steering_group), Icons.AutoMirrored.Rounded.Send) {
             SettingsAnchor(R.string.settings_anchor_steering) {
                 BehaviorValueRow(
                     title = stringResource(R.string.settings_anchor_steering),
@@ -206,7 +234,7 @@ internal fun AgentBehaviorSection(
                 }
             }
         }
-        BehaviorGroup(stringResource(R.string.questions_group), Icons.Outlined.ChatBubbleOutline) {
+        BehaviorGroup(stringResource(R.string.questions_group), Icons.Rounded.ChatBubbleOutline) {
             SettingsAnchor(R.string.auto_continue_title) {
                 Row(
                     Modifier.fillMaxWidth().clickable(role = Role.Switch) { onAutoContinueQuestions(!settings.autoContinueQuestions) }.padding(16.dp),
@@ -222,7 +250,7 @@ internal fun AgentBehaviorSection(
                 }
             }
         }
-        BehaviorGroup(stringResource(R.string.as_group), Icons.Outlined.Tune) {
+        BehaviorGroup(stringResource(R.string.as_group), Icons.Rounded.Tune) {
             SettingsAnchor(R.string.as_setting_title) {
                 BehaviorValueRow(
                     title = stringResource(R.string.as_setting_title),
@@ -233,7 +261,7 @@ internal fun AgentBehaviorSection(
             }
         }
         if (showLiveUpdates) LiveUpdatesSetting(settings, onLiveUpdates)
-        BehaviorGroup(stringResource(R.string.settings_agent_instructions_group), Icons.Outlined.Description) {
+        BehaviorGroup(stringResource(R.string.settings_agent_instructions_group), Icons.Rounded.Description) {
             SettingsAnchor(R.string.settings_anchor_project_instructions) {
                 BehaviorValueRow(
                     title = stringResource(R.string.settings_anchor_project_instructions),
@@ -253,6 +281,14 @@ internal fun AgentBehaviorSection(
             resetLabel = stringResource(R.string.resume_prompt_reset_app),
             onSave = { onResumePrompt(it.orEmpty()) },
             onDismiss = { editResumePrompt = false },
+        )
+    }
+
+    if (editStallTimeout) {
+        StallTimeoutSheet(
+            currentSeconds = settings.streamStallTimeoutSeconds,
+            onPick = { onStallTimeout(it); editStallTimeout = false },
+            onDismiss = { editStallTimeout = false },
         )
     }
 
@@ -302,7 +338,7 @@ internal fun AgentBehaviorSection(
                 title = stringResource(R.string.settings_anchor_max_context)
                 description = stringResource(R.string.settings_agent_context_cap_detail)
                 selected = settings.maxContextTokens.toString()
-                choices = (listOf(131_072, 262_144, 400_000, 1_000_000, 2_000_000) + settings.maxContextTokens)
+                choices = (listOf(32_768, 65_536, 131_072, 262_144, 400_000, 1_000_000, 2_000_000) + settings.maxContextTokens)
                     .distinct().sorted().map {
                         BehaviorChoice(it.toString(), stringResource(R.string.settings_agent_context_value, formatTokenCount(it.toLong())), "")
                     }
@@ -440,7 +476,7 @@ private fun BehaviorValueRow(
             Text(description, style = MaterialTheme.typography.bodySmall,
                 color = if (caution) FullAccessOrange else MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+        Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
     }
 }
 
@@ -454,7 +490,7 @@ internal fun LiveUpdatesSetting(settings: AppSettings, onLiveUpdates: (Boolean) 
     val context = LocalContext.current
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.BAKLAVA) {
         // Keep the control findable so search results never land on an empty spot.
-        BehaviorGroup(stringResource(R.string.settings_agent_group_live_updates), Icons.Outlined.Notifications) {
+        BehaviorGroup(stringResource(R.string.settings_agent_group_live_updates), Icons.Rounded.Notifications) {
             SettingsAnchor(R.string.settings_agent_live_updates) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(stringResource(R.string.settings_agent_live_updates), style = MaterialTheme.typography.titleSmall)
@@ -464,7 +500,7 @@ internal fun LiveUpdatesSetting(settings: AppSettings, onLiveUpdates: (Boolean) 
             }
         }
     } else {
-        BehaviorGroup(stringResource(R.string.settings_agent_group_live_updates), Icons.Outlined.Notifications) {
+        BehaviorGroup(stringResource(R.string.settings_agent_group_live_updates), Icons.Rounded.Notifications) {
             SettingsAnchor(R.string.settings_agent_live_updates) {
                 val vendor = remember { liveUpdateVendor }
                 var state by remember { mutableStateOf(liveUpdateState(context)) }

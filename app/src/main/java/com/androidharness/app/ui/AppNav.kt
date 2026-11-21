@@ -112,6 +112,11 @@ fun AppNav(container: AppContainer) {
     val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
     val sessions by container.sessions.sessions.collectAsStateWithLifecycle(initialValue = emptyList())
+    // Decoding a session's conversation JSON is a full parse; the sidebar, section motion and
+    // filters used to redo it for every session on every recomposition, which made switching lag.
+    val sessionKinds = remember(sessions) {
+        sessions.associate { it.id to com.androidharness.app.data.ConversationConfig.decode(it.conversationJson).kind }
+    }
     // Nullable gate: the synthetic AppSettings() default (onboardingDone=false)
     // used to pass for one frame as a real emission and flash the setup screen
     // for fully-onboarded users. Null = DataStore hasn't spoken yet.
@@ -120,6 +125,7 @@ fun AppNav(container: AppContainer) {
         .collectAsStateWithLifecycle(initialValue = null)
     val providers by container.providers.providers.collectAsStateWithLifecycle(initialValue = emptyList())
     val allWorkspaces by container.workspace.projects.collectAsStateWithLifecycle(initialValue = emptyList())
+    val workProjects by container.workspace.workProjects.collectAsStateWithLifecycle(initialValue = emptyList())
     val keyboard = LocalSoftwareKeyboardController.current
 
     // Setup fires exactly once, decided from DataStore's REAL first emission.
@@ -158,6 +164,13 @@ fun AppNav(container: AppContainer) {
     val desktopKeyboard = remember { DesktopKeyboardRouter() }
     androidx.compose.runtime.LaunchedEffect(desktopNavigation) {
         if (desktopNavigation) { drawerState.close(); androidx.compose.runtime.withFrameNanos { }; desktopFocus.requestFocus() }
+        else {
+            // The desktop layout hides the drawer sheet at zero width, so its state can read as open when the
+            // phone sheet comes back after a rotation. Wait for the sheet to measure, then shut it.
+            androidx.compose.runtime.withFrameNanos { }
+            androidx.compose.runtime.withFrameNanos { }
+            drawerState.snapTo(DrawerValue.Closed)
+        }
     }
 
     var searchQuery by remember { mutableStateOf("") }
@@ -250,6 +263,22 @@ fun AppNav(container: AppContainer) {
             container.settings.setLastActiveSessionId(currentSessionId)
         }
     }
+    // Opening the app or moving between chats clears blank "New chat" rows left
+    // behind, so the sidebar never collects duplicates. The open chat, the one
+    // the screen is still bound to, pinned chats and running chats are kept.
+    androidx.compose.runtime.LaunchedEffect(currentSessionId, currentEntry?.destination?.route) {
+        if (currentEntry == null) return@LaunchedEffect
+        val keep = buildSet {
+            currentSessionId?.let(::add)
+            draftSessionId?.let(::add)
+            workspaceChatViewModel?.state?.value?.sessionId?.let(::add)
+            addAll(container.runManager.runningSessionIds.value)
+            addAll(settings.pinnedSessions)
+        }
+        runCatching {
+            container.sessions.pruneUntouchedChats(keep, setOf("New chat", uiContext.getString(R.string.settings_telegram_new_chat)))
+        }
+    }
     val currentRoute = currentEntry?.destination?.route
     val drawerGesturesEnabled = drawerSwipeAllowed(currentRoute)
     // A drawer that was opening on the previous screen must not cover Settings.
@@ -262,8 +291,9 @@ fun AppNav(container: AppContainer) {
     var viewingSavedAnswer by remember { mutableStateOf<com.androidharness.app.data.db.SavedAnswerRow?>(null) }
     val savedAnswerRows by remember { container.sessions.savedAnswers() }.collectAsStateWithLifecycle(initialValue = emptyList())
     var renamingSession by remember { mutableStateOf<SessionEntity?>(null) }
-    var renamingProject by remember { mutableStateOf<ProjectEntity?>(null) }
-    var deletingProject by remember { mutableStateOf<ProjectEntity?>(null) }
+    var renamingProject by remember { mutableStateOf<com.androidharness.app.data.db.WorkProjectEntity?>(null) }
+    var deletingProject by remember { mutableStateOf<com.androidharness.app.data.db.WorkProjectEntity?>(null) }
+    var creatingProject by remember { mutableStateOf(false) }
     var projectName by remember { mutableStateOf("") }
     var detailsSession by remember { mutableStateOf<SessionEntity?>(null) }
     var deletingSession by remember { mutableStateOf<SessionEntity?>(null) }
@@ -278,7 +308,6 @@ fun AppNav(container: AppContainer) {
     }
     val sidebarSnackbar = remember { androidx.compose.material3.SnackbarHostState() }
     var showWorkspaceSheet by remember { mutableStateOf(false) }
-    var showAddWorkspace by remember { mutableStateOf(false) }
 
     // One-time notice for installs whose Linux environment predates a package
     // addition (gh): shown once, then never again, whichever button closes it.
@@ -293,13 +322,6 @@ fun AppNav(container: AppContainer) {
         showLatePackagesNotice = false
     }
 
-    // System folder picker for adding a SAF workspace from the drawer.
-    val safWorkspacePicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocumentTree(),
-    ) { uri -> uri?.let { scope.launch {
-        try { selectWorkspace(container.workspace.addPickedFolder(it).id) }
-        catch (e: Exception) { workspaceError = e.message }
-    } } }
 
     // Run-result notifications deep-link into the session's chat.
     androidx.compose.runtime.LaunchedEffect(Unit) {
@@ -368,7 +390,7 @@ fun AppNav(container: AppContainer) {
     }
     fun selectedChatAction(ids: Set<String>, action: SidebarChatAction) {
         if (batchBusy) return
-        val targets = sessions.filter { it.id in ids && com.androidharness.app.data.ConversationConfig.decode(it.conversationJson).kind == activeKind }
+        val targets = sessions.filter { it.id in ids && sessionKinds[it.id] == activeKind }
         if (targets.isEmpty()) { selectedChatIds = emptyList(); return }
         val selectedIds = targets.mapTo(mutableSetOf()) { it.id }
         when (action) {
@@ -426,7 +448,7 @@ fun AppNav(container: AppContainer) {
             com.androidharness.app.data.ConversationKind.CODE ->
                 settings.codeStart == com.androidharness.app.data.CodeStartMode.LAST_CODE
         }
-        val last = sessions.firstOrNull { com.androidharness.app.data.ConversationConfig.decode(it.conversationJson).kind == kind && it.id !in settings.archivedSessions }
+        val last = sessions.firstOrNull { sessionKinds[it.id] == kind && it.id !in settings.archivedSessions }
             ?.takeIf { resume }
         val availablePrevious = previous?.takeIf { route -> sessions.any { "chat/${it.id}" == route && it.id !in settings.archivedSessions } }
         val target = availablePrevious ?: last?.let { "chat/${it.id}" } ?: "chat?kind=${kind.name}"
@@ -438,23 +460,24 @@ fun AppNav(container: AppContainer) {
             if (entry.destination.route?.startsWith("chat") != true) return null
             return entry.arguments?.getString("kind")?.let {
                 runCatching { com.androidharness.app.data.ConversationKind.valueOf(it) }.getOrNull()
-            } ?: sessions.firstOrNull { it.id == entry.arguments?.getString("sessionId") }
-                ?.let { com.androidharness.app.data.ConversationConfig.decode(it.conversationJson).kind }
+            } ?: entry.arguments?.getString("sessionId")?.let { sessionKinds[it] }
         }
         val origin = kind(from) ?: return 0
         val destination = kind(to) ?: return 0
         val direction = if (origin == destination) 0 else if (destination == com.androidharness.app.data.ConversationKind.CHAT) 1 else -1
         return direction * if (sectionRtl) -1 else 1
     }
-    @Composable fun Sidebar(onCollapse: () -> Unit) {
+    @Composable fun Sidebar(opened: Boolean, onCollapse: () -> Unit) {
     val uiContext = androidx.compose.ui.platform.LocalContext.current
         val changes by remember(currentSessionId) {
             currentSessionId?.let(container.sessions::fileChangesFor) ?: kotlinx.coroutines.flow.flowOf(emptyList())
         }.collectAsStateWithLifecycle(initialValue = emptyList())
         ProjectNavigationSidebar(
-            projects = if (activeConversation.isChat) emptyList() else allWorkspaces, sessions = sessions.filter { com.androidharness.app.data.ConversationConfig.decode(it.conversationJson).kind == activeKind }, selectedSession = currentSessionId, selectedProject = currentWorkspace?.id,
+            projects = if (activeConversation.isChat) emptyList() else allWorkspaces, sessions = remember(sessions, sessionKinds, activeKind) { sessions.filter { sessionKinds[it.id] == activeKind } }, selectedSession = currentSessionId, selectedProject = currentEntry?.arguments?.getString("workProjectId"),
+            workProjects = if (activeConversation.isChat) emptyList() else workProjects,
+            onCreateProject = { selectedChatIds = emptyList(); scope.launch { drawerState.close() }; creatingProject = true },
             pinned = settings.pinnedSessions.toSet(), archived = settings.archivedSessions.toSet(), query = searchQuery,
-            onQueryChange = { searchQuery = it }, messageHits = messageHits.filter { hit -> sessions.any { it.id == hit.sessionId && com.androidharness.app.data.ConversationConfig.decode(it.conversationJson).kind == activeKind } }, fuzzy = fuzzySearch, onFuzzyChange = { fuzzySearch = !fuzzySearch },
+            onQueryChange = { searchQuery = it }, messageHits = remember(messageHits, sessionKinds, activeKind) { messageHits.filter { hit -> sessionKinds[hit.sessionId] == activeKind } }, fuzzy = fuzzySearch, onFuzzyChange = { fuzzySearch = !fuzzySearch },
             activity = { session ->
                 if (session.id in runningSessionIds) {
                     val live by remember(session.id) { container.runManager.live(session.id) }.collectAsStateWithLifecycle()
@@ -462,13 +485,14 @@ fun AppNav(container: AppContainer) {
                 } else sidebarActivity(false, session.pendingPlan)
             },
             onNewChat = { navigateFromSidebar {
-                scope.launch { currentWorkspace?.id?.let { container.workspace.setActiveProject(it) }; openChat(null) }
+                // New chats start in the workspace the user last picked, not the open chat's.
+                openChat(null)
             } }, onChat = { sid -> navigateFromSidebar { openChat(sid) } },
             onMessage = { hit -> navigateFromSidebar { openChat(hit.sessionId, hit.messageId) } },
             onProjectChat = { project -> if (!creatingProjectChat) {
                 creatingProjectChat = true
                 val create = { scope.launch {
-                    try { openChat(container.sessions.createSession(uiContext.getString(R.string.settings_telegram_new_chat), project.id)) }
+                    try { openChat(container.runManager.createProjectChat(project.id, uiContext.getString(R.string.settings_telegram_new_chat))) }
                     catch (e: Exception) { if (e is kotlinx.coroutines.CancellationException) throw e; workspaceError = e.message ?: uiContext.getString(R.string.ui_could_not_create_chat) }
                     finally { creatingProjectChat = false }
                 }; Unit }
@@ -478,7 +502,7 @@ fun AppNav(container: AppContainer) {
                     desktopGuard.navigate { creatingProjectChat = true; create() }
                 } else create()
             } },
-            onProjects = { navigateFromSidebar { nav.navigate("projects") { launchSingleTop = true } } },
+            onProjects = { navigateFromSidebar { nav.navigate("work-projects") { launchSingleTop = true } } },
             onChatActions = { actionsSession = it }, onAction = ::sidebarAction,
             selectedChats = selectedChatIds.toSet(), onSelectedChatsChange = { selectedChatIds = it.toList() },
             onSelectedChatsAction = ::selectedChatAction, selectionBusy = batchBusy,
@@ -492,6 +516,7 @@ fun AppNav(container: AppContainer) {
             workspaceLabel = if (chatWorkspaceContext) uiContext.getString(R.string.ui_workspaces_for_this_chat) else uiContext.getString(R.string.ui_workspace), workspaceSummary = workspaceSummary,
             onWorkspaces = { selectedChatIds = emptyList(); scope.launch { drawerState.close() }; showWorkspaceSheet = true },
             onCollapse = { if (!batchBusy) { selectedChatIds = emptyList(); onCollapse() } },
+            opened = opened,
             currentRoute = currentRoute, projectCreationEnabled = !creatingProjectChat,
             changesSummary = changes.takeIf { it.isNotEmpty() }?.let { uiContext.getString(R.string.ui_files_changed_758, (it.size).toString()) },
             onChanges = { currentSessionId?.let { sid -> navigateFromSidebar { nav.navigate("changes/${encode(sid)}") } } },
@@ -509,7 +534,7 @@ fun AppNav(container: AppContainer) {
             onProjectsViewChange = { scope.launch { container.settings.setSidebarProjects(it) } },
             projectPins = settings.pinnedProjects, projectArchives = settings.archivedProjects,
             onProjectAction = { project, action -> when (action) {
-                SidebarProjectAction.OPEN -> navigateFromSidebar { nav.navigate("project/${encode(project.id)}") { launchSingleTop = true } }
+                SidebarProjectAction.OPEN -> navigateFromSidebar { nav.navigate("work-project/${encode(project.id)}") { launchSingleTop = true } }
                 SidebarProjectAction.RENAME -> { projectName = project.name; renamingProject = project }
                 SidebarProjectAction.DELETE -> {
                     val show = { deletingProject = project; Unit }
@@ -593,7 +618,9 @@ fun AppNav(container: AppContainer) {
         drawerState = drawerState,
         gesturesEnabled = !desktopNavigation && drawerGesturesEnabled,
         drawerContent = {
+            // Passing the state gives the sheet Material's predictive back: it follows the back swipe and shrinks before closing.
             if (!desktopNavigation) ModalDrawerSheet(
+                drawerState = drawerState,
                 modifier = if (glass) Modifier.onSizeChanged { glassDrawerWidth = it.width }
                     .padding(horizontal = 10.dp).statusBarsPadding().navigationBarsPadding().padding(vertical = 8.dp) else Modifier,
                 drawerShape = if (glass) androidx.compose.foundation.shape.RoundedCornerShape(32.dp) else androidx.compose.material3.DrawerDefaults.shape,
@@ -603,7 +630,8 @@ fun AppNav(container: AppContainer) {
                 androidx.compose.runtime.CompositionLocalProvider(
                     LocalHarnessGlassCaptureActive provides glassDrawerCapture,
                     LocalHarnessGlassBackdrop provides (LocalHarnessGlassOverlayBackdrop.current ?: LocalHarnessGlassBackdrop.current)) {
-                Sidebar { scope.launch { drawerState.close() } }
+                val drawerOpening by remember(drawerState) { androidx.compose.runtime.derivedStateOf { drawerState.targetValue == DrawerValue.Open } }
+                Sidebar(drawerOpening) { scope.launch { drawerState.close() } }
                 }
             }
         },
@@ -622,7 +650,7 @@ fun AppNav(container: AppContainer) {
         }.then(if (desktopNavigation) Modifier.focusable() else Modifier).then(if (desktopNavigation) Modifier.statusBarsPadding().navigationBarsPadding() else Modifier)) {
             RetainedWorkspaceContent(desktopNavigation && sidebarVisible,
                 Modifier.width(if (desktopNavigation && sidebarVisible) 232.dp else 0.dp)) {
-                Sidebar { sidebarVisible = false }
+                Sidebar(desktopNavigation && sidebarVisible) { sidebarVisible = false }
             }
             Column(Modifier.weight(1f).fillMaxHeight()) {
         if (currentRoute?.startsWith("project") != true) {
@@ -637,29 +665,31 @@ fun AppNav(container: AppContainer) {
                 val direction = sectionMotion(initialState, targetState)
                 if (direction == 0) fadeIn(tween(220, easing = FastOutSlowInEasing)) +
                     slideInVertically(tween(240, easing = FastOutSlowInEasing)) { it / 28 }
-                else fadeIn(com.androidharness.app.ui.theme.expressiveEffectsSpec()) +
-                    androidx.compose.animation.scaleIn(com.androidharness.app.ui.theme.expressiveSpatialSpec(), initialScale = .98f) +
-                    androidx.compose.animation.slideInHorizontally(com.androidharness.app.ui.theme.expressiveSpatialSpec()) { it / 10 * direction }
+                // The new section fades in on top right away while the old one stays solid
+                // underneath, so the window background never shows through mid-switch.
+                else fadeIn(tween(200, easing = FastOutSlowInEasing)) +
+                    androidx.compose.animation.slideInHorizontally(com.androidharness.app.ui.theme.defaultSpatialSpec()) { it / 14 * direction }
             },
             exitTransition = {
                 val direction = sectionMotion(initialState, targetState)
                 if (direction == 0) fadeOut(tween(180, easing = FastOutSlowInEasing))
-                else fadeOut(com.androidharness.app.ui.theme.expressiveEffectsSpec()) +
-                    androidx.compose.animation.slideOutHorizontally(com.androidharness.app.ui.theme.expressiveSpatialSpec()) { -it / 20 * direction }
+                else fadeOut(tween(100, delayMillis = 200)) +
+                    androidx.compose.animation.slideOutHorizontally(com.androidharness.app.ui.theme.defaultSpatialSpec()) { -it / 24 * direction }
             },
             popEnterTransition = {
                 val direction = sectionMotion(initialState, targetState)
                 if (direction == 0) fadeIn(tween(220, easing = FastOutSlowInEasing))
-                else fadeIn(com.androidharness.app.ui.theme.expressiveEffectsSpec()) +
-                    androidx.compose.animation.scaleIn(com.androidharness.app.ui.theme.expressiveSpatialSpec(), initialScale = .98f) +
-                    androidx.compose.animation.slideInHorizontally(com.androidharness.app.ui.theme.expressiveSpatialSpec()) { it / 10 * direction }
+                // The new section fades in on top right away while the old one stays solid
+                // underneath, so the window background never shows through mid-switch.
+                else fadeIn(tween(200, easing = FastOutSlowInEasing)) +
+                    androidx.compose.animation.slideInHorizontally(com.androidharness.app.ui.theme.defaultSpatialSpec()) { it / 14 * direction }
             },
             popExitTransition = {
                 val direction = sectionMotion(initialState, targetState)
                 if (direction == 0) fadeOut(tween(180, easing = FastOutSlowInEasing)) +
                     slideOutVertically(tween(200, easing = FastOutSlowInEasing)) { it / 28 }
-                else fadeOut(com.androidharness.app.ui.theme.expressiveEffectsSpec()) +
-                    androidx.compose.animation.slideOutHorizontally(com.androidharness.app.ui.theme.expressiveSpatialSpec()) { -it / 20 * direction }
+                else fadeOut(tween(100, delayMillis = 200)) +
+                    androidx.compose.animation.slideOutHorizontally(com.androidharness.app.ui.theme.defaultSpatialSpec()) { -it / 24 * direction }
             },
         ) {
             composable("chat?kind={kind}", arguments = listOf(navArgument("kind") { defaultValue = "CODE" })) { entry ->
@@ -850,6 +880,27 @@ fun AppNav(container: AppContainer) {
                     onBack = { nav.popBackStack() },
                     onOpenSession = { openChat(it) })
             }
+            composable("work-projects") {
+                com.androidharness.app.ui.projects.WorkProjectsScreen(container, onBack = { nav.popBackStack() },
+                    onOpenProject = { nav.navigate("work-project/${encode(it)}") }, onCreate = { creatingProject = true })
+            }
+            composable("work-project/{workProjectId}", arguments = listOf(navArgument("workProjectId") { type = NavType.StringType })) { entry ->
+                val id = requireNotNull(entry.arguments?.getString("workProjectId"))
+                com.androidharness.app.ui.projects.WorkProjectScreen(container, id, onBack = { nav.popBackStack() },
+                    onOpenChat = { openChat(it) },
+                    onNewChat = { customTitle ->
+                        if (!creatingProjectChat) {
+                            creatingProjectChat = true
+                            scope.launch {
+                                try { openChat(container.runManager.createProjectChat(id, uiContext.getString(R.string.settings_telegram_new_chat), customTitle)) }
+                                catch (e: Exception) { if (e is kotlinx.coroutines.CancellationException) throw e; workspaceError = e.message ?: uiContext.getString(R.string.ui_could_not_create_chat) }
+                                finally { creatingProjectChat = false }
+                            }
+                        }
+                    }, creatingChat = creatingProjectChat,
+                    onOpenWorkspace = { nav.navigate("project/${encode(it)}") },
+                    onDelete = { deletingProject = it })
+            }
             composable("projects") {
                 ProjectsScreen(container, onBack = { nav.popBackStack() },
                     onOpenProject = { nav.navigate("project/${encode(it)}") },
@@ -960,7 +1011,7 @@ fun AppNav(container: AppContainer) {
                 )
             }
             composable("skills") {
-                SkillsScreen(container = container, onBack = { nav.popBackStack() })
+                com.androidharness.app.ui.settings.SettingsExpressiveTheme { SkillsScreen(container = container, onBack = { nav.popBackStack() }) }
             }
             composable("stats") {
                 com.androidharness.app.ui.stats.StatsScreen(
@@ -969,7 +1020,7 @@ fun AppNav(container: AppContainer) {
                 )
             }
             composable("providers") {
-                ProvidersScreen(container = container, onBack = { nav.popBackStack() })
+                com.androidharness.app.ui.settings.SettingsExpressiveTheme { ProvidersScreen(container = container, onBack = { nav.popBackStack() }) }
             }
             composable("setup") {
                 com.androidharness.app.ui.setup.SetupScreen(
@@ -987,48 +1038,28 @@ fun AppNav(container: AppContainer) {
     }
     }
 
-    androidx.activity.compose.BackHandler(enabled = !desktopNavigation && drawerState.isOpen) {
-        scope.launch { drawerState.close() }
-    }
+    // The drawer sheet owns back while open (predictive back); a plain handler here would override its animation.
 
     com.androidharness.app.ui.common.ShizukuDisabledWarning(container.shizuku.workspaceWarning)
 
-    // The sidebar opens the same per-chat access editor, including unsent chats.
+    // One switcher for the sidebar, the chat header and unsent chats.
     if (showWorkspaceSheet) {
         com.androidharness.app.ui.common.ShizukuWorkspaceWarningEffect(container.shizuku)
-        if (chatWorkspaceContext) com.androidharness.app.ui.chat.components.ChatWorkspaceManagerSheet(
-            container, workspaceSessionId, onDismiss = { showWorkspaceSheet = false },
-            onSave = workspaceChatViewModel?.let { vm -> vm::saveWorkspaces })
-        else com.androidharness.app.ui.chat.components.WorkspaceSwitcherSheet(
-            projects = allWorkspaces,
-            currentProjectId = currentWorkspace?.id,
-            chatWorkspace = workspaceSessionId != null,
-            describe = { container.workspace.describe(it) },
-            onSelect = ::selectWorkspace,
-            onAdd = { showAddWorkspace = true },
-            onDismiss = { showWorkspaceSheet = false },
-            onDelete = { project ->
-                scope.launch {
-                    try { container.workspace.deleteProject(project) }
-                    catch (e: Exception) { workspaceError = e.message }
-                }
-            },
+        com.androidharness.app.ui.chat.components.WorkspaceSwitcher(
+            container, sessionId = workspaceSessionId, currentWorkspaceId = currentWorkspace?.id,
+            onSelect = ::selectWorkspace, onDismiss = { showWorkspaceSheet = false },
+            onError = { workspaceError = it },
+            onOpenProject = { id -> nav.navigate("work-project/${encode(id)}") { launchSingleTop = true } },
+            onManageWorkspaces = { nav.navigate("projects") { launchSingleTop = true } },
+            chatContext = chatWorkspaceContext,
         )
     }
+    if (creatingProject) com.androidharness.app.ui.chat.components.ProjectEditorSheet(container, project = null,
+        initialWorkspaceId = currentWorkspace?.id, onDismiss = { creatingProject = false },
+        onSaved = { created -> creatingProject = false; nav.navigate("work-project/${encode(created.id)}") { launchSingleTop = true } })
     workspaceError?.let { message ->
         AlertDialog(onDismissRequest = { workspaceError = null }, title = { Text(uiContext.getString(R.string.ui_workspace)) },
             text = { Text(message) }, confirmButton = { TextButton(onClick = { workspaceError = null }) { Text(uiContext.getString(R.string.ui_ok)) } })
-    }
-    if (showAddWorkspace) {
-        com.androidharness.app.ui.common.AddWorkspaceDialog(
-            container = container,
-            onSelected = ::selectWorkspace,
-            onDismiss = { showAddWorkspace = false },
-            onPickSaf = {
-                showAddWorkspace = false
-                safWorkspacePicker.launch(null)
-            },
-        )
     }
 
     // One-time "the toolchain gained new packages" notice for installs that
@@ -1179,12 +1210,12 @@ fun AppNav(container: AppContainer) {
     }
 
     deletingProject?.let { project ->
-        com.androidharness.app.ui.projects.ProjectDeletionDialog(container, project,
+        com.androidharness.app.ui.projects.WorkProjectDeletionDialog(container, project,
             onDismiss = { deletingProject = null }, onDeleted = { deletedChats ->
                 deletingProject = null
                 scope.launch { drawerState.close() }
                 if (draftSessionId in deletedChats) draftSessionId = null
-                nav.navigate("projects") { popUpTo(nav.graph.id); launchSingleTop = true }
+                if (currentSessionId in deletedChats || currentEntry?.arguments?.getString("workProjectId") == project.id) openChat(null)
             })
     }
 
@@ -1192,7 +1223,7 @@ fun AppNav(container: AppContainer) {
         AlertDialog(onDismissRequest = { renamingProject = null }, title = { Text(uiContext.getString(R.string.ui_rename_project)) },
             text = { OutlinedTextField(projectName, { projectName = it }, singleLine = true, label = { Text(uiContext.getString(R.string.ui_project_name)) }) },
             confirmButton = { TextButton(enabled = projectName.isNotBlank(), onClick = { scope.launch {
-                try { container.workspace.renameProject(project.id, projectName); renamingProject = null }
+                try { container.workspace.renameWorkProject(project.id, projectName); renamingProject = null }
                 catch (e: Exception) { if (e is kotlinx.coroutines.CancellationException) throw e; workspaceError = e.message }
             } }) { Text(uiContext.getString(R.string.settings_action_save)) } },
             dismissButton = { TextButton(onClick = { renamingProject = null }) { Text(uiContext.getString(R.string.settings_action_cancel)) } })

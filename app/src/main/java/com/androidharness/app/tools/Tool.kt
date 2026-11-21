@@ -38,6 +38,7 @@ data class ToolResult(
     val research: com.androidharness.app.core.ResearchReceipt? = null,
     val settings: com.androidharness.app.core.SettingsReceipt? = null,
     val chatHistory: com.androidharness.app.core.ChatHistoryReceipt? = null,
+    val storageAccess: com.androidharness.app.core.StorageAccessReceipt? = null,
 )
 
 class ToolFailure(message: String) : Exception(message)
@@ -94,11 +95,15 @@ class ToolRegistry(private val tools: List<Tool>) {
             fileHistory: com.androidharness.app.data.WorkspaceFileHistory? = null,
             memory: com.androidharness.app.data.MemoryRepository? = null,
             searchApiRefresh: suspend () -> SearchApiConfig? = { searchApi() },
+            searchSetup: () -> SearchSetup = { SearchSetup.single(searchApi()) },
+            searchSetupRefresh: suspend () -> SearchSetup = { SearchSetup.single(searchApiRefresh()) },
             dhizuku: com.androidharness.app.data.env.DhizukuManager? = null,
             deviceAccess: com.androidharness.app.data.env.DeviceAccessManager? = null,
             pullRequests: (() -> com.androidharness.app.github.PullRequestPublisher?)? = null,
             sessionMessages: suspend (String) -> List<com.androidharness.app.core.ChatMessage> = { emptyList() },
             appSettings: com.androidharness.app.data.SettingsRepository? = null,
+            automations: AutomationToolHost? = null,
+            plugins: com.androidharness.app.plugins.PluginManager? = null,
         ): ToolRegistry {
             val baseTools = mutableListOf<Tool>(
                 ListDirTool(),
@@ -136,9 +141,13 @@ class ToolRegistry(private val tools: List<Tool>) {
                 MoveFileTool(),
                 WebFetchTool(httpClient, searchApi = searchApi, refreshApi = searchApiRefresh,
                     renderedReader = browserController?.let { browser -> { budget -> BrowserReadTool(browser, budget) } }),
-                WebSearchTool(httpClient, searchApi, refreshApi = searchApiRefresh),
+                WebFetchTool(httpClient, searchApi = searchApi, refreshApi = searchApiRefresh).let { pages ->
+                    WebSearchTool(httpClient, searchApi, refreshApi = searchApiRefresh,
+                        pageReader = SearchPageReader(pages::readText), setup = searchSetup, refreshSetup = searchSetupRefresh)
+                },
                 HttpRequestTool(httpClient) { linuxEnv.githubToken() },
                 AskUserTool(),
+                StorageAccessTool { shellRouter.isAllFilesAccess() },
                 VisualGuideTool(),
                 TaskTool(),
                 MemoryWriteTool(),
@@ -156,8 +165,15 @@ class ToolRegistry(private val tools: List<Tool>) {
             )
             if (appSettings != null) {
                 val read: suspend () -> com.androidharness.app.data.AppSettings = { appSettings.settings.first() }
-                baseTools += AppSettingsFindTool(read)
-                baseTools += AppSettingsChangeTool(appSettings, read)
+                val skillNames: suspend () -> List<String> = { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { skills.list().map { it.name } } }
+                baseTools += AppSettingsFindTool(skillNames, read)
+                baseTools += AppSettingsChangeTool(appSettings, skillNames, read)
+                if (plugins != null) baseTools += AppPluginsTool(plugins, read)
+            }
+            if (automations != null) {
+                baseTools += AutomationCreateTool(automations)
+                baseTools += AutomationListTool(automations)
+                baseTools += AutomationManageTool(automations)
             }
             if (dhizuku != null && deviceAccess != null) baseTools += DeviceOwnerShellTool(dhizuku, deviceAccess)
             if (pullRequests != null) baseTools += GitHubCreatePullRequestTool(pullRequests, sessionMessages)

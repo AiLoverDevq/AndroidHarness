@@ -10,7 +10,7 @@ object WorkspaceToolRouting {
     private val fileTools = setOf("list_dir", "read_file", "file_info", "write_file", "edit_file", "multi_edit",
         "apply_patch", "search_files", "grep", "create_dir", "delete_file", "move_file", "read_image",
         "memory_write", "memory_read", "memory_search", "file_history", "file_restore")
-    private val independentTools = setOf("reference_read", "search_agent_knowledge", "read_chat_text", "zoom_chat_image", "offer_code_handoff", "create_artifact", "read_artifact", "read_tool_output", "ask_user", "task", "todo_write", "web_fetch", "web_search", "http_request", "read_logcat", "browser_open_external", "remember", "recall", "github_api", "github_search", "github_file", "skill_view", "skills_list", "visual_guide", AppSettingsFindTool.NAME, AppSettingsChangeTool.NAME)
+    private val independentTools = setOf("reference_read", "search_agent_knowledge", "read_chat_text", "zoom_chat_image", "offer_code_handoff", "create_artifact", "read_artifact", "read_tool_output", "ask_user", "request_storage_access", "task", "todo_write", "web_fetch", "web_search", "http_request", "read_logcat", "browser_open_external", "remember", "recall", "github_api", "github_search", "github_file", "skill_view", "skills_list", "visual_guide", AppSettingsFindTool.NAME, AppSettingsChangeTool.NAME, AppPluginsTool.NAME)
     private fun requiresCommandPath(name: String) = name == "shell" || name == "shell_background" || name.startsWith("git_")
 
     fun available(tool: Tool, ctx: ToolContext): Boolean {
@@ -61,6 +61,23 @@ object WorkspaceToolRouting {
         val target = if (tool.name in fileTools) selected.fileAccess(binding) else binding.fs
         if (!available(tool, context.copy(workspace = binding.fs, sandboxOff = false))) throw ToolFailure("${tool.name} is unavailable in ${binding.name}.")
         return Route(target, binding, selected)
+    }
+
+    /**
+     * Stops a call that would touch shared storage without the storage grant. File tools always
+     * run as the app user; commands pass when a privileged shell runs them or the call pins one.
+     */
+    suspend fun requireStorage(tool: Tool, args: JsonObject, route: Route) {
+        val root = (route.binding?.fs ?: route.workspace).shellRoot ?: return
+        fun text(key: String) = (args[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
+        when {
+            tool.name in fileTools -> com.androidharness.app.data.env.StorageGate.awaitFiles(tool.name, root)
+            requiresCommandPath(tool.name) -> {
+                if (text("access") in setOf("shizuku", "root")) return
+                val cwd = text("cwd")?.trim()?.takeIf { it.startsWith('/') }?.let { java.io.File(it) } ?: root
+                com.androidharness.app.data.env.StorageGate.awaitCommand(tool.name, cwd)
+            }
+        }
     }
 
     fun instructions(workspace: ChatWorkspaceFs): String = buildString {

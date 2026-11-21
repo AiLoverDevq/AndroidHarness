@@ -1,5 +1,7 @@
 package com.androidharness.app.ui.chat.components
 
+import androidx.compose.foundation.relocation.bringIntoViewRequester
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.interaction.DragInteraction
@@ -95,7 +97,8 @@ internal fun ChatActivity(
         live && completedPhase -> if (lastTool!!.result?.isError == true) stringResource(R.string.chat_tool_failed) else activityLabel(lastTool.call.name, false)
         live && writing -> stringResource(R.string.chat_writing_reply)
         live -> stringResource(R.string.chat_thinking)
-        seconds > 0 && !showThinkingMetrics -> stringResource(R.string.chat_thought_seconds, seconds)
+        seconds > 0 && !showThinkingMetrics -> stringResource(R.string.chat_thought_duration,
+            com.androidharness.app.ui.common.formatDuration(seconds * 1000))
         else -> stringResource(R.string.chat_thought)
     }
     // Each step change of a live turn is felt once; a row that merely scrolls back into view stays silent.
@@ -112,7 +115,26 @@ internal fun ChatActivity(
         seenStep = step
         if (step != null) onStep(step.first)
     }
+    val introContext = androidx.compose.ui.platform.LocalContext.current
+    // The model has sent something of its own: reasoning, words, or a tool call.
+    val modelStarted = entries.isNotEmpty() || writing || runningCalls.isNotEmpty() ||
+        streamingThinking.isNotEmpty() || thinkingTiming?.startedAt != null
+    // The brand intro plays for a turn that has just started, and for one still waiting on
+    // the model when it comes back into view, but not for a turn already under way.
+    var introDone by rememberSaveable(turnStartedAt != null) {
+        mutableStateOf(!(live && turnStartedAt != null &&
+            (!modelStarted || com.androidharness.app.agent.ThinkingTiming.now() - turnStartedAt < 1_500) &&
+            android.provider.Settings.Global.getFloat(introContext.contentResolver,
+                android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) > 0f))
+    }
+    Column(Modifier.fillMaxWidth()) {
+    // The intro ends on the same glyph in the same spot, so a short crossfade is all the handoff needs.
+    AnimatedContent(introDone || !live, transitionSpec = {
+        fadeIn(tween(160)) togetherWith fadeOut(tween(120))
+    }, label = "Chat turn intro") { showActivity ->
+    if (!showActivity) ChatTurnIntro(started = modelStarted || !live, onFinished = { introDone = true }) else
     ChatActivityRow(title, if (live && showToolPhase) (active ?: lastTool?.call?.takeIf { completedPhase })?.name else null, live, entries.isNotEmpty(), followLatest = live, autoExpand = autoExpand,
+        writing = live && writing && active == null,
         progress = research,
         trailing = if (showThinkingMetrics) ({ ChatThinkingMetrics(messages, streamingThinking, thinkingTiming, reasoningTokens, live,
             turnStartedAt = turnStartedAt, streamId = streamId) }) else null) {
@@ -122,7 +144,7 @@ internal fun ChatActivity(
                     item(key = entry.key + "-heading") {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                         Icon(painterResource(R.drawable.ic_brain), null, Modifier.size(13.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text(if (entry.milliseconds >= 1000) stringResource(R.string.chat_thought_seconds, entry.milliseconds / 1000)
+                        Text(if (entry.milliseconds >= 1000) stringResource(R.string.chat_thought_duration, com.androidharness.app.ui.common.formatDuration(entry.milliseconds))
                             else stringResource(R.string.chat_thought), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     }
@@ -142,6 +164,13 @@ internal fun ChatActivity(
                     running = live && entry.result == null, onOpenUrl) }
             }
         }
+    }
+    }
+    // While the answer is being written the chips sit under it instead (see ChatScreen).
+    if (live && introDone && !writing) {
+        val sources = remember(messages) { ChatActivityPresentation.sources(messages) }
+        LiveSourceChips(sources, messages.firstNotNullOfOrNull { it.turnId }, onOpenUrl)
+    }
     }
 }
 
@@ -235,6 +264,8 @@ private fun ChatActivityRow(
     expandable: Boolean,
     followLatest: Boolean = false,
     autoExpand: Boolean = true,
+    /** The answer is streaming: the working log steps aside so the reply has the focus. */
+    writing: Boolean = false,
     progress: ChatActivityPresentation.ResearchProgress? = null,
     trailing: (@Composable () -> Unit)? = null,
     compactPreview: Boolean = false,
@@ -259,6 +290,14 @@ private fun ChatActivityRow(
             expanded = false
             autoOpened = false
         }
+    }
+    // Fold the log once, as the first words of the answer land, and leave it
+    // folded for the rest of the turn. Reopening it whenever the model went back
+    // to a tool made the reply below jump up and down; the row title still
+    // names the live step.
+    var foldedForAnswer by remember { mutableStateOf(false) }
+    LaunchedEffect(writing) {
+        if (writing && live && autoOpened && !foldedForAnswer) { foldedForAnswer = true; expanded = false }
     }
     val scroll = rememberChatListState()
     // Retain the reader's follow preference when this disclosure survives a stream commit.
@@ -324,7 +363,24 @@ private fun ChatActivityRow(
     val context = androidx.compose.ui.platform.LocalContext.current
     val motion = remember(context) { android.provider.Settings.Global.getFloat(context.contentResolver,
         android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) > 0f }
-    Column(Modifier.fillMaxWidth()) {
+    // A card the reader opens scrolls itself into view, through any card it sits in,
+    // once its expand animation settles. Auto-opened live logs leave scrolling alone.
+    val reveal = remember { androidx.compose.foundation.relocation.BringIntoViewRequester() }
+    var revealOnOpen by remember { mutableStateOf(false) }
+    var cardHeight by remember { androidx.compose.runtime.mutableIntStateOf(0) }
+    LaunchedEffect(revealOnOpen) {
+        if (!revealOnOpen) return@LaunchedEffect
+        var last = -1
+        var steady = 0
+        val deadline = System.nanoTime() + 1_200_000_000L
+        while (expanded && steady < 3 && System.nanoTime() < deadline) {
+            withFrameNanos { }
+            if (cardHeight == last) steady++ else { steady = 0; last = cardHeight }
+        }
+        if (expanded) reveal.bringIntoView()
+        revealOnOpen = false
+    }
+    Column(Modifier.fillMaxWidth().bringIntoViewRequester(reveal).onSizeChanged { cardHeight = it.height }) {
         val header: @Composable () -> Unit = {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -341,7 +397,7 @@ private fun ChatActivityRow(
         }
         CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides 40.dp) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            if (expandable) TextButton(onClick = { pauseParent(); detailScroll?.pause(); expanded = !expanded }, modifier = Modifier.weight(1f),
+            if (expandable) TextButton(onClick = { pauseParent(); detailScroll?.pause(); expanded = !expanded; revealOnOpen = expanded }, modifier = Modifier.weight(1f),
                 shape = RoundedCornerShape(12.dp), contentPadding = PaddingValues(horizontal = 4.dp)) { header() }
             else Box(Modifier.weight(1f).heightIn(min = 36.dp).padding(horizontal = 4.dp), contentAlignment = Alignment.CenterStart) { header() }
             if (expanded && inlineDetails == null) IconButton(onClick = { pauseParent(); detailScroll?.pause(); following = false; readerOpen = true }) {
@@ -432,7 +488,7 @@ internal fun ChatSources(messages: List<ChatMessage>, onOpenUrl: (String) -> Uni
             Text(stringResource(R.string.chat_sources), style = MaterialTheme.typography.titleLarge)
             Text(stringResource(R.string.chat_sources_explanation), style = MaterialTheme.typography.bodySmall, color = scheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp, bottom = 12.dp))
             sources.forEach { source ->
-                TextButton(onClick = { open = false; onOpenUrl(source.url) }, shape = RoundedCornerShape(12.dp), contentPadding = PaddingValues(vertical = 10.dp, horizontal = 8.dp), modifier = Modifier.fillMaxWidth()) {
+                TextButton(onClick = { open = false; onOpenUrl(source.url) }, shape = RoundedCornerShape(12.dp), contentPadding = PaddingValues(vertical = 10.dp, horizontal = 8.dp), modifier = Modifier.fillMaxWidth().markPreviewOrigin()) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                         Text(source.title, style = MaterialTheme.typography.titleSmall)
                         Text(source.host, style = MaterialTheme.typography.bodySmall, color = scheme.onSurfaceVariant)
@@ -609,6 +665,7 @@ private fun activityLabel(name: String, running: Boolean): String = stringResour
     "offer_code_handoff" -> R.string.chat_preparing_code_option
     "app_settings_find" -> if (running) R.string.as_activity_finding else R.string.as_activity_found
     "app_settings_change" -> if (running) R.string.as_activity_changing else R.string.as_activity_changed
+    "app_plugins" -> if (running) R.string.as_activity_plugins else R.string.as_activity_plugins_done
     else -> if (running) R.string.chat_working else R.string.chat_finished_activity
 })
 

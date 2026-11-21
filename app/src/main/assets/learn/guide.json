@@ -1169,7 +1169,7 @@
         },
         {
           "title": "Set up search if needed",
-          "body": "Keyless search needs no search API key. For Brave or Tavily, select that backend in Settings → Web search, obtain its own key, and use the app’s verification/save action."
+          "body": "Keyless search needs no search API key, and Marginalia works with its shared public key. For Brave, Serper, SerpApi, Tavily, Linkup, LangSearch, Jina or Firecrawl, select that provider in Settings → Web search, get a key from it, and save it there (up to 20 keys per provider, each tested before it is saved)."
         },
         {
           "title": "Give the question boundaries",
@@ -1182,7 +1182,7 @@
       ],
       "outcome": "The answer includes relevant sources when research succeeds, and you can open the pages yourself.",
       "limits": [
-        "Search keys are separate from model-provider keys. A model key does not automatically enable Brave or Tavily.",
+        "Search keys are separate from model-provider keys. A model key does not automatically enable any search provider.",
         "Paywalls, logins, blocked websites, unavailable Reddit pages, and network failures can prevent reading. Deeper research uses more time and model/tool requests."
       ],
       "fixes": [
@@ -2389,40 +2389,40 @@
     {
       "id": "multi-workspace",
       "category": "code",
-      "title": "Use several workspaces in one Code chat",
-      "summary": "Let one task compare or coordinate selected projects.",
-      "location": "Code → workspace selector → Workspaces for this chat.",
+      "title": "Work across several workspaces with a project",
+      "summary": "Group workspaces into a project so one chat can work across all of them.",
+      "location": "Sidebar → Projects → plus button, or Code → workspace selector → New project.",
       "before": [
-        "Add each project to AndroidHarness first.",
-        "Pause active work before changing the conversation’s file access."
+        "Add each folder as a workspace first.",
+        "Pause active work in the project’s chats before changing its workspaces."
       ],
       "steps": [
         {
-          "title": "Choose the projects",
-          "body": "Open Workspaces for this chat and select only the projects the task needs."
+          "title": "Create the project",
+          "body": "Tap the plus button next to Projects in the sidebar, name the project and select only the workspaces the work needs."
         },
         {
           "title": "Set access for each",
-          "body": "Choose Read only or Can edit per workspace. Pick the Primary workspace; it is the default destination for new files."
+          "body": "Choose Read only or Can edit per workspace. Pick the main workspace. It is the default destination for new files."
         },
         {
           "title": "Save and name the task boundaries",
-          "body": "Save the selection, then tell the assistant which project each part belongs to. Check the workspace context before approving edits."
+          "body": "Save the project and start a chat in it, then tell the assistant which workspace each part belongs to. Check the workspace context before approving edits."
         },
         {
           "title": "Use file tools within the grants",
-          "body": "The assistant can read the selected projects and edit the ones granted edit access. Review every affected project after a cross-project change."
+          "body": "The assistant can read the project’s workspaces and edit the ones granted edit access. Review every affected workspace after a change that spans several."
         }
       ],
-      "outcome": "The conversation has explicit per-project access and a clear primary workspace.",
+      "outcome": "Every chat in the project has explicit access per workspace and a clear main workspace.",
       "limits": [
         "Commands and integrations require edit access to all selected workspaces.",
-        "Workspace MCP servers are not available in multi-workspace chats yet. Per-workspace access still matters even if another chat can edit that folder."
+        "Workspace MCP servers are not available in project chats with several workspaces yet. A normal Code chat uses one workspace; only a project holds several."
       ],
       "fixes": [
         {
           "problem": "Commands or integrations disappear",
-          "solution": "Review the access warning in the sheet. Use a single workspace or grant the required edit access only when appropriate."
+          "solution": "Review the access warning in the project editor. Use a single workspace or grant the required edit access only when appropriate."
         }
       ],
       "related": [
@@ -2438,7 +2438,7 @@
         }
       ],
       "sources": [
-        "ui/chat/components/ChatWorkspacesSheet.kt",
+        "ui/chat/components/ProjectEditorSheet.kt",
         "workspace/ChatWorkspaces.kt",
         "tools/WorkspaceToolRouting.kt"
       ],
@@ -5507,6 +5507,65 @@
         "tools/DoctorTool.kt"
       ],
       "keywords": ""
+    },
+    {
+      "id": "provider-debug",
+      "category": "help",
+      "title": "Read the provider request log",
+      "summary": "See the exact call that failed and what the provider answered.",
+      "location": "Settings → Provider request log.",
+      "before": [
+        "Capture is off by default. Reproduce the problem once with it on, or the page stays empty."
+      ],
+      "steps": [
+        {
+          "title": "Turn capture on",
+          "body": "Switch capture on at the top of the page, then send the failing message from any chat and come back. Only traffic recorded while capture is on shows up, so enable it before the attempt you want to see."
+        },
+        {
+          "title": "Read the request before the reply",
+          "body": "Each entry lists the endpoint, method, status and timing, which separates a 401, 429 or 400 from a slow or truncated stream. Filter by chat or by text when the list gets long."
+        },
+        {
+          "title": "Include bodies only for the request you are chasing",
+          "body": "Prompts, replies and raw stream events are large and private. Turn Include bodies on for one attempt, read it, then turn it off again. Without it the log keeps only URLs, headers and status."
+        },
+        {
+          "title": "Keep it or take it with you",
+          "body": "Capture lives in memory and is cleared when the app closes. Export or Save to file writes a readable log you can paste into a bug report; Keep on this device stores it encrypted for the next session."
+        }
+      ],
+      "outcome": "You can point at the failing request, say which side produced the error, and keep a log that shows it.",
+      "limits": [
+        "The log holds HTTP traffic only. Local models never send requests, so their runs never appear here.",
+        "Credentials are masked and storage paths become placeholders, but prompts and replies are your own text; read a saved log before sharing it.",
+        "Capture adds work to every request. Leave it off when you are not chasing something."
+      ],
+      "fixes": [
+        {
+          "problem": "The page stays empty",
+          "solution": "Confirm capture is on, confirm the chat uses a cloud provider, then send a new message. Requests made before capture was enabled were never recorded."
+        }
+      ],
+      "related": [
+        "troubleshooting",
+        "api-errors",
+        "honest-limits"
+      ],
+      "actions": [
+        {
+          "kind": "settings",
+          "target": "PROVIDER_DEBUG",
+          "label": "Open request log"
+        }
+      ],
+      "sources": [
+        "ui/settings/ProviderDebugSection.kt",
+        "llm/debug/DebugInterceptor.kt",
+        "llm/debug/DebugTraceStore.kt",
+        "llm/debug/DebugRedact.kt"
+      ],
+      "keywords": "request log trace http capture debug"
     },
     {
       "id": "api-errors",

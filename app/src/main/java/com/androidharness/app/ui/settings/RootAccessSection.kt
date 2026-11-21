@@ -1,6 +1,7 @@
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3ExpressiveApi::class)
+
 package com.androidharness.app.ui.settings
 
-import com.androidharness.app.ui.theme.HarnessGlassSwitch as Switch
 import com.androidharness.app.ui.common.localizedOption
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
@@ -12,7 +13,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.*
+import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -41,6 +42,7 @@ internal fun RootAccessSection(container: AppContainer) {
     val access = container.deviceAccess
     val prefs by access.preferences.collectAsStateWithLifecycle()
     val root by access.root.state.collectAsStateWithLifecycle()
+    val rootConnected by access.root.connected.collectAsStateWithLifecycle()
     val paused by access.paused.collectAsStateWithLifecycle()
     val allowance by access.allowanceLabel.collectAsStateWithLifecycle()
     val last by access.lastExecution.collectAsStateWithLifecycle()
@@ -56,17 +58,19 @@ internal fun RootAccessSection(container: AppContainer) {
     var browser by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
     var useMenu by remember { mutableStateOf(false) }
     var confirmUnlimited by remember { mutableStateOf(false) }
+    // Opening the card re-checks the runner so it never shows a binding that is already gone.
+    LaunchedEffect(Unit) { access.reconnectRoot() }
 
     SettingsPanel(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(Modifier.settingsAnchor(R.string.settings_root_title), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Icon(Icons.Outlined.AdminPanelSettings, null, tint = MaterialTheme.colorScheme.primary)
+                Icon(Icons.Rounded.AdminPanelSettings, null, tint = MaterialTheme.colorScheme.primary)
                 Column(Modifier.weight(1f)) {
                     Text(stringResource(R.string.settings_root_title), style = MaterialTheme.typography.titleMedium)
                     Text(localizedOption(root.status.label), style = MaterialTheme.typography.bodySmall,
                         color = if (root.status == RootStatus.READY) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                if (busy || root.status == RootStatus.REQUESTING) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                if (busy || root.status == RootStatus.REQUESTING) LoadingIndicator(Modifier.size(28.dp))
             }
             Text(root.detail, style = MaterialTheme.typography.bodySmall,
                 color = if (root.status == RootStatus.DENIED || (root.status == RootStatus.UNAVAILABLE && root.checkedAt > 0))
@@ -78,6 +82,7 @@ internal fun RootAccessSection(container: AppContainer) {
             if (shizukuUid == 0) Text(stringResource(R.string.settings_root_shizuku_available), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
             val rootEnabled = rootChipEnabled(
                 root.status,
+                rootConnected,
                 access.rootUseActive(settings.lastActiveSessionId, prefs),
             )
             AccessActionPair(first = { buttonModifier ->
@@ -89,7 +94,7 @@ internal fun RootAccessSection(container: AppContainer) {
                 ) {
                     Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Icon(Icons.Outlined.CheckCircle, null, Modifier.size(18.dp))
+                        Icon(Icons.Rounded.CheckCircle, null, Modifier.size(18.dp))
                         Text(stringResource(R.string.settings_root_enabled), style = MaterialTheme.typography.titleSmall)
                     }
                 } else Button(onClick = { scope.launch {
@@ -120,6 +125,14 @@ internal fun RootAccessSection(container: AppContainer) {
                 !prefs.autoFallback && prefs.mode != AccessMode.NORMAL -> uiContext.getString(R.string.ui_commands_fail_if_the_selected_access_is)
                 else -> uiContext.getString(R.string.ui_fallback_applies_before_a_command_starts_interrupted)
             }, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().settingsAnchor(R.string.settings_ask_phone_control)) {
+                Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text(stringResource(R.string.settings_ask_phone_control), style = MaterialTheme.typography.titleSmall)
+                    Text(stringResource(R.string.settings_ask_phone_control_desc),
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Switch(checked = prefs.askPhoneControl, onCheckedChange = { scope.launch { access.store.setAskPhoneControl(it) } })
+            }
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().settingsAnchor(R.string.settings_root_app_workspace_privileged)) {
                 Column(Modifier.weight(1f).padding(end = 12.dp)) {
                     Text(stringResource(R.string.settings_root_app_workspace_privileged), style = MaterialTheme.typography.titleSmall)
@@ -146,7 +159,7 @@ internal fun RootAccessSection(container: AppContainer) {
                 Text(stringResource(R.string.settings_root_temp_use), style = MaterialTheme.typography.titleSmall)
                 Box {
                     OutlinedButton(onClick = { useMenu = true }, modifier = Modifier.fillMaxWidth()) {
-                        Text(localizedOption(prefs.rootUse.label), Modifier.weight(1f)); Icon(Icons.Outlined.ExpandMore, null)
+                        Text(localizedOption(prefs.rootUse.label), Modifier.weight(1f)); Icon(Icons.Rounded.ExpandMore, null)
                     }
                     DropdownMenu(expanded = useMenu, onDismissRequest = { useMenu = false }) {
                         RootUse.entries.forEach { use -> DropdownMenuItem(text = { Text(localizedOption(use.label)) },
@@ -158,7 +171,7 @@ internal fun RootAccessSection(container: AppContainer) {
             } else Text(stringResource(R.string.settings_root_temp_note),
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             OutlinedButton(onClick = { projectPicker = true }, enabled = prefs.temporaryRoot, modifier = Modifier.fillMaxWidth().settingsAnchor(R.string.settings_root_project_permissions)) {
-                Icon(Icons.Outlined.Folder, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp))
+                Icon(Icons.Rounded.Folder, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp))
                 Text(stringResource(R.string.settings_root_project_permissions), Modifier.weight(1f))
                 Text(stringResource(R.string.settings_root_project_count, projects.count { it.id in prefs.rootProjects }.toString()), style = MaterialTheme.typography.labelMedium)
             }
@@ -178,7 +191,7 @@ internal fun RootAccessSection(container: AppContainer) {
                     busy = true
                     try { report = access.stopPrivileged() } finally { busy = false }
                 } }, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
-                    Icon(Icons.Outlined.StopCircle, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text(stringResource(R.string.settings_root_stop_tasks))
+                    Icon(Icons.Rounded.StopCircle, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text(stringResource(R.string.settings_root_stop_tasks))
                 }
             }
         }
@@ -198,7 +211,7 @@ internal fun RootAccessSection(container: AppContainer) {
         } }, confirmButton = { TextButton(onClick = { projectPicker = false }) { Text(stringResource(R.string.settings_action_done)) } })
     if (confirmUnlimited) AlertDialog(
         onDismissRequest = { confirmUnlimited = false },
-        icon = { Icon(Icons.Outlined.WarningAmber, null, tint = MaterialTheme.colorScheme.error) },
+        icon = { Icon(Icons.Rounded.WarningAmber, null, tint = MaterialTheme.colorScheme.error) },
         title = { Text(stringResource(R.string.settings_root_everywhere_title)) },
         text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text(stringResource(R.string.settings_root_everywhere_note))
@@ -223,8 +236,8 @@ internal fun RootAccessSection(container: AppContainer) {
  * status line; counting it here claimed root was enabled after a denied
  * KernelSU/Magisk grant while the detail said no connection was active.
  */
-internal fun rootChipEnabled(status: RootStatus, useActive: Boolean): Boolean =
-    status == RootStatus.READY && useActive
+internal fun rootChipEnabled(status: RootStatus, connected: Boolean, useActive: Boolean): Boolean =
+    status == RootStatus.READY && connected && useActive
 
 @Composable
 internal fun AccessModeChoices(selected: AccessMode, onSelect: (AccessMode) -> Unit) {

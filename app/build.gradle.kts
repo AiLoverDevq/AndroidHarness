@@ -39,19 +39,6 @@ val hasNdk: Boolean = run {
     sdk.resolve("ndk/$pinnedNdk").isDirectory
 }
 
-// Fast 32-bit CI passes -PharnessAbis=armeabi-v7a to skip the heavy llama.cpp
-// 64-bit builds. Without the property all four ABIs are built (existing
-// nightly / gpu-runtime behaviour unchanged).
-val allAbis = listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-val harnessAbis: List<String> = providers.gradleProperty("harnessAbis")
-    .orNull
-    ?.split(',')
-    ?.map { it.trim() }
-    ?.filter { it.isNotEmpty() }
-    ?.takeIf { it.isNotEmpty() }
-    ?: allAbis
-require(harnessAbis.all { it in allAbis }) { "harnessAbis must be a subset of $allAbis" }
-
 android {
     if (distributionChannel == "play") dynamicFeatures += setOf(":local_gpu")
     sourceSets.getByName("main").java.srcDir("src/${distributionChannel}Delivery/java")
@@ -75,12 +62,12 @@ android {
         applicationId = "com.androidharness.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 38
-        versionName = "3.4"
+        versionCode = 40
+        versionName = "4.0"
         buildConfigField("String", "GITHUB_CLIENT_ID", "\"$githubClientId\"")
         buildConfigField("boolean", "PLAY_DISTRIBUTION", (distributionChannel == "play").toString())
         if (hasNdk) {
-            ndk { abiFilters += harnessAbis }
+            ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64") }
             externalNativeBuild {
                 cmake { arguments += listOf("-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON", "-DHARNESS_GPU_OUTPUT=${layout.buildDirectory.dir("generated/gpuNative").get().asFile}") }
             }
@@ -280,21 +267,19 @@ abstract class PrepareGpuRuntime @Inject constructor(private val execOps: ExecOp
     @get:InputDirectory abstract val nativeDirectory: DirectoryProperty
     @get:Optional @get:InputDirectory abstract val externalPackages: DirectoryProperty
     @get:InputFile abstract val stripTool: RegularFileProperty
-    @get:Input abstract val selectedAbis: ListProperty<String>
     @get:OutputDirectory abstract val assetDirectory: DirectoryProperty
     @get:OutputDirectory abstract val packageDirectory: DirectoryProperty
     @get:OutputDirectory abstract val featureDirectory: DirectoryProperty
 
     @TaskAction fun prepare() {
         listOf(assetDirectory, packageDirectory, featureDirectory).forEach { it.get().asFile.deleteRecursively(); it.get().asFile.mkdirs() }
-        val selected = selectedAbis.get()
-        for (abi in selected.filter { it in listOf("armeabi-v7a", "x86") }) {
+        for (abi in listOf("armeabi-v7a", "x86")) {
             val stub = featureDirectory.file("$abi/libharness_gpu_unavailable.so").get().asFile
             stub.parentFile.mkdirs()
             nativeDirectory.file("$abi/libharness_gpu_unavailable.so").get().asFile.copyTo(stub, overwrite = true)
             execOps.exec { commandLine(stripTool.get().asFile, "--strip-unneeded", stub) }.assertNormalExitValue()
         }
-        for (abi in selected.filter { it in listOf("arm64-v8a", "x86_64") }) {
+        for (abi in listOf("arm64-v8a", "x86_64")) {
             val source = nativeDirectory.file("$abi/libggml-vulkan.so").get().asFile
             val library = featureDirectory.file("$abi/libggml-vulkan.so").get().asFile
             library.parentFile.mkdirs()
@@ -333,7 +318,6 @@ if (hasNdk) androidComponents.onVariants { variant ->
         nativeDirectory.set(layout.buildDirectory.dir("generated/gpuNative/${if (variant.buildType == "debug") "Debug" else "RelWithDebInfo"}"))
         providers.gradleProperty("gpuRuntimePackages").orNull?.let { externalPackages.set(file(it)) }
         stripTool.set(strip)
-        selectedAbis.set(harnessAbis)
         assetDirectory.set(layout.buildDirectory.dir("generated/gpuDelivery/${variant.name}/assets"))
         packageDirectory.set(layout.buildDirectory.dir("outputs/gpuRuntime/${variant.name}"))
         featureDirectory.set(layout.buildDirectory.dir("generated/gpuDelivery/${variant.name}/jniLibs"))

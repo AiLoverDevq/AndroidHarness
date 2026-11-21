@@ -35,6 +35,8 @@ data class SessionEntity(
     val modelSelectionJson: String? = null,
     val workspaceSelectionJson: String? = null,
     val conversationJson: String? = null,
+    /** The user-made project this chat belongs to. Null for an ordinary chat with one workspace. */
+    val workProjectId: String? = null,
 )
 
 @kotlinx.serialization.Serializable
@@ -107,13 +109,28 @@ data class MessageFtsEntity(
     val text: String,
 )
 
+/** One workspace: a folder the agent can work in. The table keeps its original name. */
 @Entity(tableName = "projects")
 data class ProjectEntity(
     @PrimaryKey val id: String,
     val name: String,
-    val kind: String, // "APP" or "SAF"
+    val kind: String, // "APP", "SAF", "SHELL" or "SSH"
     val uri: String?,
     val lastUsedAt: Long,
+)
+
+/**
+ * A project the user created: a name and the workspaces its chats work across.
+ * [selectionJson] is an encoded ChatWorkspaceSelection (grants plus the primary workspace).
+ */
+@Entity(tableName = "work_projects")
+data class WorkProjectEntity(
+    @PrimaryKey val id: String,
+    val name: String,
+    val selectionJson: String,
+    val createdAt: Long,
+    /** How new chats in this project are named, such as "ALPHA #". Null keeps "New chat". See ChatSeries. */
+    val chatNamePattern: String? = null,
 )
 
 /** A saved fact or reviewed digest, owned by a section and optionally scoped to a project. */
@@ -360,6 +377,32 @@ interface HarnessDao {
         deleteProject(project)
     }
 
+    /**
+     * Deletes the app workspace's chats but keeps its row: the workspace itself is the
+     * permanent default, so "reset" only empties it. Its folder is cleared separately.
+     */
+    @androidx.room.Transaction
+    suspend fun deleteAppWorkspaceChats(projectId: String, expectedChatIds: Set<String>) {
+        val project = requireNotNull(project(projectId)) { "This workspace is no longer available." }
+        check(project.kind == "APP") { "Only the app workspace can be reset this way." }
+        val chats = projectSessions(projectId)
+        check(chats.all { it.projectId == projectId }) {
+            "Chats in another project still use this workspace. Remove its access from those chats before resetting it."
+        }
+        check(chats.map { it.id }.toSet() == expectedChatIds) {
+            "The workspace's chats changed. Close this dialog and review the reset again."
+        }
+        chats.forEach { chat ->
+            deleteSavedAnswers(chat.id)
+            deleteMessages(chat.id)
+            deleteCheckpoints(chat.id)
+            deleteUsageEvents(chat.id)
+            deleteFileEdits(chat.id)
+            deleteSessionFileChanges(chat.id)
+            deleteSession(chat)
+        }
+    }
+
     @Insert
     suspend fun insertSession(session: SessionEntity)
 
@@ -531,6 +574,11 @@ interface HarnessDao {
     @Query("SELECT * FROM sessions WHERE id IN (:ids)")
     suspend fun sessionsByIds(ids: List<String>): List<SessionEntity>
 
+    /** Chats that were created but never used: no messages, no requests, no summary or plan. */
+    @Query("SELECT * FROM sessions WHERE requestCount = 0 AND compactionSummary = '' AND pendingPlan IS NULL " +
+        "AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.sessionId = sessions.id)")
+    suspend fun untouchedSessions(): List<SessionEntity>
+
     // chat backup (export/import)
     @Query("SELECT * FROM sessions ORDER BY createdAt ASC")
     suspend fun allSessions(): List<SessionEntity>
@@ -545,7 +593,38 @@ interface HarnessDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertImportedMessages(messages: List<MessageEntity>)
 
-    // projects
+    // user-made projects
+    @Query("SELECT * FROM work_projects ORDER BY createdAt DESC")
+    fun workProjectsFlow(): Flow<List<WorkProjectEntity>>
+
+    @Query("SELECT * FROM work_projects WHERE id = :id")
+    suspend fun workProject(id: String): WorkProjectEntity?
+
+    @Insert
+    suspend fun insertWorkProject(project: WorkProjectEntity)
+
+    @Query("UPDATE work_projects SET name = :name WHERE id = :id")
+    suspend fun renameWorkProject(id: String, name: String)
+
+    @Query("UPDATE work_projects SET chatNamePattern = :pattern WHERE id = :id")
+    suspend fun setWorkProjectChatNames(id: String, pattern: String?)
+
+    @Query("UPDATE work_projects SET selectionJson = :selection WHERE id = :id")
+    suspend fun setWorkProjectSelection(id: String, selection: String)
+
+    @Query("DELETE FROM work_projects WHERE id = :id")
+    suspend fun deleteWorkProject(id: String)
+
+    @Query("SELECT * FROM sessions WHERE workProjectId = :id")
+    suspend fun workProjectSessions(id: String): List<SessionEntity>
+
+    @Query("UPDATE sessions SET workProjectId = :workProjectId WHERE id = :id")
+    suspend fun setSessionWorkProject(id: String, workProjectId: String?)
+
+    @Query("SELECT * FROM sessions WHERE workProjectId IS NULL AND workspaceSelectionJson IS NOT NULL")
+    suspend fun unfiledSelectionSessions(): List<SessionEntity>
+
+    // workspaces
     @Query("SELECT * FROM projects ORDER BY lastUsedAt DESC")
     fun projectsFlow(): Flow<List<ProjectEntity>>
 
@@ -755,6 +834,7 @@ interface HarnessDao {
         SessionEntity::class,
         MessageEntity::class,
         ProjectEntity::class,
+        WorkProjectEntity::class,
         CheckpointEntity::class,
         SnippetEntity::class,
         UsageEventEntity::class,
@@ -766,13 +846,24 @@ interface HarnessDao {
         ChatAnswerVersionEntity::class,
         SavedAnswerEntity::class,
     ],
-    version = 25,
+    version = 27,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun dao(): HarnessDao
 
     companion object {
+        val MIGRATION_26_27 = object : androidx.room.migration.Migration(26, 27) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE work_projects ADD COLUMN chatNamePattern TEXT")
+            }
+        }
+        val MIGRATION_25_26 = object : androidx.room.migration.Migration(25, 26) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS work_projects (id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL, selectionJson TEXT NOT NULL, createdAt INTEGER NOT NULL)")
+                db.execSQL("ALTER TABLE sessions ADD COLUMN workProjectId TEXT")
+            }
+        }
         val MIGRATION_24_25 = object : androidx.room.migration.Migration(24, 25) {
             override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
                 db.execSQL("CREATE TABLE IF NOT EXISTS saved_answers (messageId TEXT NOT NULL PRIMARY KEY, sessionId TEXT NOT NULL, text TEXT NOT NULL, answeredAt INTEGER NOT NULL, savedAt INTEGER NOT NULL)")

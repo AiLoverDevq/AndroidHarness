@@ -176,6 +176,7 @@ object OpenAiAudioClient {
         model: String,
         voice: String,
         speed: Float,
+        onEdgeForbidden: (suspend () -> Unit)? = null,
     ): Result<File> = withContext(Dispatchers.IO) {
         val dir = File(cacheDir, "tts").apply { mkdirs() }
         val format = responseFormat(provider, model)
@@ -184,7 +185,7 @@ object OpenAiAudioClient {
         val key = sha256("v3|${provider.id}|$model|$voice|$speed|$text")
         val file = File(dir, "$key.$format")
         if (file.exists() && file.length() > 0) return@withContext Result.success(file)
-        synthesize(provider, apiKey, text, model, voice, speed).mapCatching { bytes ->
+        synthesize(provider, apiKey, text, model, voice, speed, onEdgeForbidden).mapCatching { bytes ->
             val temp = File(dir, "$key.part")
             temp.writeBytes(bytes)
             if (!temp.renameTo(file)) {
@@ -203,6 +204,7 @@ object OpenAiAudioClient {
         model: String,
         voice: String,
         speed: Float,
+        onEdgeForbidden: (suspend () -> Unit)? = null,
     ): Result<ByteArray> {
         if (text.isBlank() || text.none(Char::isLetterOrDigit)) {
             return Result.failure(IllegalArgumentException("Nothing to speak"))
@@ -214,6 +216,7 @@ object OpenAiAudioClient {
             VoiceProtocol.DEEPGRAM -> DeepgramVoiceClient.synthesize(provider, apiKey, text, model, voice, speed)
             VoiceProtocol.ASSEMBLYAI ->
                 Result.failure(UnsupportedOperationException("AssemblyAI does not offer text to speech"))
+            VoiceProtocol.EDGE -> EdgeTtsClient.synthesize(text, voice, speed, onForbidden = onEdgeForbidden)
         }
     }
 
@@ -269,6 +272,7 @@ object OpenAiAudioClient {
     const val ORPHEUS_MAX_INPUT_CHARS = 190
 
     fun maxInputChars(provider: VoiceProviderConfig, model: String): Int = when {
+        provider.protocol == VoiceProtocol.EDGE -> EdgeTtsClient.MAX_INPUT_CHARS
         model.contains("orpheus", true) -> ORPHEUS_MAX_INPUT_CHARS
         else -> MAX_INPUT_CHARS
     }
@@ -296,10 +300,19 @@ object OpenAiAudioClient {
         VoiceProtocol.CARTESIA -> CARTESIA_VOICES.keys.toList()
         VoiceProtocol.DEEPGRAM -> DEMO_VOICES
         VoiceProtocol.ASSEMBLYAI -> emptyList()
+        VoiceProtocol.EDGE -> VoicePresets.edgeVoices
     }
 
-    fun defaultVoiceFor(provider: VoiceProviderConfig, model: String): String? =
-        voicesFor(provider, model).firstOrNull() ?: provider.ttsVoice.ifBlank { null }
+    /**
+     * Default voice for a model. Only falls back to the provider's configured
+     * voice when the model is the provider's own default; an unknown model id
+     * returns null so the UI asks for a voice instead of guessing.
+     */
+    fun defaultVoiceFor(provider: VoiceProviderConfig, model: String): String? {
+        voicesFor(provider, model).firstOrNull()?.let { return it }
+        val isProviderDefault = model.isBlank() || model == provider.ttsModel
+        return if (isProviderDefault) provider.ttsVoice.ifBlank { null } else null
+    }
 
     fun modelLabel(provider: VoiceProviderConfig, model: String): String = when {
         provider.id == VoicePresets.EDGE -> provider.name

@@ -116,7 +116,9 @@ class FileFs(private val root: File) : WorkspaceFs {
             .onEnter { dir -> !WorkspaceIgnore.shouldSkipEnter(path, dir.name) }
             .asSequence()
             .map { FileFsNode(it, rootPath) }
-            .filter { n -> !n.isFile || !WorkspaceIgnore.shouldSkip(n.relPath, path) }
+            // An entry the app cannot even stat (system folders in Full access) is left out
+            // instead of aborting the whole search.
+            .filter { n -> runCatching { !n.isFile || !WorkspaceIgnore.shouldSkip(n.relPath, path) }.getOrDefault(false) }
     }
 }
 
@@ -283,18 +285,25 @@ class UnboundedFileFs(root: File) : WorkspaceFs {
         throw e
     }
 
+    // Full access lifts the workspace boundary, not Android's storage permission.
+    private fun gated(path: String): File = openResolve(path).also {
+        com.androidharness.app.data.env.StorageGate.requireFiles("This file tool", it)
+    }
+
     override fun resolve(path: String): FsNode =
-        FileFsNode(openResolve(path), rootPath)
+        FileFsNode(gated(path), rootPath)
 
     override fun walk(path: String): Sequence<FsNode> {
-        val file = openResolve(path)
+        val file = gated(path)
         if (!file.exists()) throw ToolFailure("Path does not exist: $path")
         if (file.isFile) return sequenceOf(FileFsNode(file, rootPath))
         return file.walkTopDown()
             .onEnter { dir -> !WorkspaceIgnore.shouldSkipEnter(path, dir.name) }
             .asSequence()
             .map { f -> FileFsNode(f, rootPath) }
-            .filter { n -> !n.isFile || !WorkspaceIgnore.shouldSkip(n.relPath, path) }
+            // An entry the app cannot even stat (system folders in Full access) is left out
+            // instead of aborting the whole search.
+            .filter { n -> runCatching { !n.isFile || !WorkspaceIgnore.shouldSkip(n.relPath, path) }.getOrDefault(false) }
     }
 }
 
@@ -418,10 +427,14 @@ class SafFsNode(
         }
     }
 
-    override fun writeBytes(data: ByteArray) {
+    override fun writeBytes(data: ByteArray) = streamTo { it.write(data) }
+
+    override fun writeFrom(input: java.io.InputStream) = streamTo { input.copyTo(it) }
+
+    private fun streamTo(write: (java.io.OutputStream) -> Unit) {
         val target = resolveWriteTarget()
         context.contentResolver.openOutputStream(target.uri, "wt")?.use { out ->
-            out.write(data)
+            write(out)
             out.flush()
             if (out is java.io.FileOutputStream) {
                 runCatching { out.fd.sync() }
